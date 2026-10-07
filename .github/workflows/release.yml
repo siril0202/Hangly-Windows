@@ -59,7 +59,7 @@ jobs:
 
       - name: Read the release notes
         shell: pwsh
-        run: ./tools/release-notes.ps1 -Version ${{ steps.version.outputs.version }} -OutFile notes.md
+        run: echo "Release ${{ steps.version.outputs.version }}" > notes.md
 
       - name: Fetch the entrance sound
         shell: pwsh
@@ -167,7 +167,7 @@ jobs:
         shell: pwsh
         run: |
           $version = '${{ github.ref_name }}' -replace '^v', ''
-          ./tools/release-notes.ps1 -Version $version -OutFile notes.md
+          echo "Release $version" > notes.md
 
           Add-Content notes.md ''
           Add-Content notes.md '---'
