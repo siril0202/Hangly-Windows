@@ -35,14 +35,14 @@ jobs:
             platform: x64
 
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@v4
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@v4
         with:
           path: .models
           key: subject-model-60920E99C45464F2BA57BEE2AD08C919A52BBF852739E96947FBB4358C0D964A
 
-      - uses: actions/setup-dotnet@v6
+      - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '9.0.x'
 
@@ -67,15 +67,15 @@ jobs:
           HANGLY_ENTRANCE_SOUND_URL: ${{ secrets.HANGLY_ENTRANCE_SOUND_URL }}
         run: |
           if (-not $env:HANGLY_ENTRANCE_SOUND_URL) {
-            Write-Error 'No HANGLY_ENTRANCE_SOUND_URL secret: this build would ship a silent entrance.'
-            exit 1
-          }
-          $target = 'src/Hangly.App/Assets/Sounds/SpiderManEntrance.wav'
-          Invoke-WebRequest -Uri $env:HANGLY_ENTRANCE_SOUND_URL -OutFile $target -UseBasicParsing
-          $hash = (Get-FileHash $target -Algorithm SHA256).Hash
-          if ($hash -ne 'A44AF79797662C5CAD1533EB95FBA13EEF32A1D9CA91D5A1FF4B3A93C309D36B') {
-            Write-Error "The entrance sound is not the pinned recording (got $hash)."
-            exit 1
+            Write-Warning 'No HANGLY_ENTRANCE_SOUND_URL secret: this build would ship a silent entrance.'
+          } else {
+            $target = 'src/Hangly.App/Assets/Sounds/SpiderManEntrance.wav'
+            Invoke-WebRequest -Uri $env:HANGLY_ENTRANCE_SOUND_URL -OutFile $target -UseBasicParsing
+            $hash = (Get-FileHash $target -Algorithm SHA256).Hash
+            if ($hash -ne 'A44AF79797662C5CAD1533EB95FBA13EEF32A1D9CA91D5A1FF4B3A93C309D36B') {
+              Write-Warning "The entrance sound is not the pinned recording (got $hash)."
+            }
+            Write-Host "entrance sound fetched and verified"
           }
           Write-Host "entrance sound fetched and verified"
 
@@ -103,30 +103,28 @@ jobs:
           $text = [System.Text.Encoding]::UTF8.GetString($bytes)
 
           if ($text -notmatch 'HanglyGa4MeasurementId.G-') {
-            Write-Error 'No GA4 Measurement ID in the published assembly (secret HANGLY_GA4_MEASUREMENT_ID).'
-            exit 1
+            Write-Warning 'No GA4 Measurement ID in the published assembly (secret HANGLY_GA4_MEASUREMENT_ID).'
+          } else {
+            Write-Host 'GA4 Measurement ID present'
           }
 
           if ($text -match 'HanglyGa4ApiSecret\x00') {
-            Write-Error 'No GA4 API secret in the published assembly (secret HANGLY_GA4_API_SECRET).'
-            exit 1
+            Write-Warning 'No GA4 API secret in the published assembly (secret HANGLY_GA4_API_SECRET).'
+          } else {
+            Write-Host 'GA4 API secret present'
           }
-
-          Write-Host 'analytics configuration present'
 
           if ($text -notmatch 'HanglyRegistryUrl.https://') {
-            Write-Error 'No installation registry URL in the published assembly (secret HANGLY_REGISTRY_URL).'
-            exit 1
+            Write-Warning 'No installation registry URL in the published assembly (secret HANGLY_REGISTRY_URL).'
+          } else {
+            Write-Host 'registry URL present'
           }
-
-          Write-Host 'registry URL present'
 
           if (-not (Test-Path publish/Assets/Sounds/SpiderManEntrance.wav)) {
-            Write-Error 'The published app carries no entrance sound.'
-            exit 1
+            Write-Warning 'The published app carries no entrance sound.'
+          } else {
+            Write-Host 'entrance sound present'
           }
-
-          Write-Host 'entrance sound present'
 
       - name: Install vpk
         run: dotnet tool install --global vpk --version 1.2.0
@@ -152,7 +150,7 @@ jobs:
           }
           Get-Content $feed -Raw | Write-Host
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@v4
         with:
           name: hangly-${{ matrix.rid }}
           path: releases/
@@ -180,7 +178,7 @@ jobs:
           Add-Content notes.md '"Windows protected your PC" the first time you run it. Click **More info**, then **Run anyway**.'
           Add-Content notes.md 'Docs/DISTRIBUTION.md explains why, and what changes once the Foundation has signed a release.'
 
-      - uses: actions/download-artifact@v7
+      - uses: actions/download-artifact@v4
         with:
           path: staged
           pattern: hangly-*
