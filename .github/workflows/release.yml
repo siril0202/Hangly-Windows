@@ -1,0 +1,221 @@
+# Builds, packages and publishes a release.
+#
+# Runs only on a tag, because a release is a deliberate act: pushing to main should never
+# produce one. The tag is the version — v0.9.0 packages 0.9.0 — so there is one place a
+# version is decided and it is the same place the release is named.
+#
+# Nothing here signs anything. SignPath will not sign a project that has not released yet,
+# so the first release is unsigned by construction; Docs/DISTRIBUTION.md §3 has the
+# reasoning and what changes afterwards.
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+# Firebase and Google Analytics configuration comes only from repository secrets —
+# nothing is written in this public file. The publish step refuses to ship a build that
+# is missing any of it, since the symptom of a missing value is silence.
+jobs:
+  package:
+    name: Package (${{ matrix.rid }})
+    runs-on: windows-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-arm64
+            platform: ARM64
+          - rid: win-x64
+            platform: x64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Creator Studio's model (170 MB) is fetched by the build and checked against the
+      # SHA-256 pinned in Hangly.App.csproj. Cached under that hash, so it is downloaded
+      # once rather than on every run, and a new pin is a new cache.
+      - uses: actions/cache@v6
+        with:
+          path: .models
+          key: subject-model-60920E99C45464F2BA57BEE2AD08C919A52BBF852739E96947FBB4358C0D964A
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Read the version from the tag
+        id: version
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}' -replace '^v', ''
+          if ($version -notmatch '^\d+\.\d+\.\d+$') {
+            Write-Host "::error::'${{ github.ref_name }}' is not vMAJOR.MINOR.PATCH"
+            exit 1
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      # Fails here rather than after a twenty-minute build if the release was never
+      # written up. The same file reaches the package and the release page.
+      - name: Read the release notes
+        shell: pwsh
+        run: ./tools/release-notes.ps1 -Version ${{ steps.version.outputs.version }} -OutFile notes.md
+
+      # The Spider-Man entrance's recording is not in this public repository
+      # (src/Hangly.App/Assets/Sounds/README.md), so a checkout has no sound and
+      # every CI build of 2.1.0 shipped a silent entrance. It is fetched from the
+      # release store — by a URL kept as a repository secret, not written here —
+      # and checked against the hash pinned below before anything is built.
+      - name: Fetch the entrance sound
+        shell: pwsh
+        env:
+          HANGLY_ENTRANCE_SOUND_URL: ${{ secrets.HANGLY_ENTRANCE_SOUND_URL }}
+        run: |
+          if (-not $env:HANGLY_ENTRANCE_SOUND_URL) {
+            Write-Error 'No HANGLY_ENTRANCE_SOUND_URL secret: this build would ship a silent entrance.'
+            exit 1
+          }
+          $target = 'src/Hangly.App/Assets/Sounds/SpiderManEntrance.wav'
+          Invoke-WebRequest -Uri $env:HANGLY_ENTRANCE_SOUND_URL -OutFile $target -UseBasicParsing
+          $hash = (Get-FileHash $target -Algorithm SHA256).Hash
+          if ($hash -ne 'A44AF79797662C5CAD1533EB95FBA13EEF32A1D9CA91D5A1FF4B3A93C309D36B') {
+            Write-Error "The entrance sound is not the pinned recording (got $hash)."
+            exit 1
+          }
+          Write-Host "entrance sound fetched and verified"
+
+      - name: Publish
+        shell: pwsh
+        # A repository secret, never written in this public file: the installation
+        # registry's URL. Missing, the build registers nothing — which the check below
+        # refuses to ship.
+        env:
+          HANGLY_REGISTRY_URL: ${{ secrets.HANGLY_REGISTRY_URL }}
+          HANGLY_GA4_MEASUREMENT_ID: ${{ secrets.HANGLY_GA4_MEASUREMENT_ID }}
+          HANGLY_GA4_API_SECRET: ${{ secrets.HANGLY_GA4_API_SECRET }}
+        run: |
+          dotnet publish src/Hangly.App/Hangly.App.csproj `
+            -c Release -r ${{ matrix.rid }} -p:Platform=${{ matrix.platform }} `
+            -p:Version=${{ steps.version.outputs.version }} `
+            -p:HanglyRegistryUrl=$env:HANGLY_REGISTRY_URL `
+            -p:HanglyGa4MeasurementId=$env:HANGLY_GA4_MEASUREMENT_ID `
+            -p:HanglyGa4ApiSecret=$env:HANGLY_GA4_API_SECRET `
+            -o publish
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      # The configuration is compiled in, so a build that lost it is a build that reports
+      # nothing and says nothing about it. v0.9.1 shipped that way. Checked here rather than
+      # trusted, because the symptom is silence.
+      - name: Check the registry and analytics configuration made it in
+        shell: pwsh
+        run: |
+          # Searched as bytes rather than as text. An AssemblyMetadata value lives in the
+          # custom-attribute blob as UTF-8, and asking Select-String for 'unicode' -- which
+          # means UTF-16 -- found nothing and failed a build that was perfectly fine.
+          $dll = Join-Path publish 'Hangly.dll'
+          $bytes = [System.IO.File]::ReadAllBytes($dll)
+          $text = [System.Text.Encoding]::UTF8.GetString($bytes)
+          if ($text -notmatch 'HanglyGa4MeasurementId.G-') {
+            Write-Error 'No GA4 Measurement ID in the published assembly (secret HANGLY_GA4_MEASUREMENT_ID).'
+            exit 1
+          }
+          # An empty value is stored as a zero length byte straight after the key.
+          if ($text -match 'HanglyGa4ApiSecret\x00') {
+            Write-Error 'No GA4 API secret in the published assembly (secret HANGLY_GA4_API_SECRET).'
+            exit 1
+          }
+          Write-Host 'analytics configuration present'
+          # The key's name is always there; its value follows after one length byte.
+          if ($text -notmatch 'HanglyRegistryUrl.https://') {
+            Write-Error 'No installation registry URL in the published assembly (secret HANGLY_REGISTRY_URL).'
+            exit 1
+          }
+          Write-Host 'registry URL present'
+          # The entrance plays whatever sits in Assets/Sounds; nothing there is a silent entrance.
+          if (-not (Test-Path publish/Assets/Sounds/SpiderManEntrance.wav)) {
+            Write-Error 'The published app carries no entrance sound.'
+            exit 1
+          }
+          Write-Host 'entrance sound present'
+
+      - name: Install vpk
+        run: dotnet tool install --global vpk --version 1.2.0
+
+      # The channel is passed explicitly and is the runtime identifier. vpk defaults to
+      # "win", which would put ARM64 and x64 on one line of releases and offer an ARM64
+      # machine an x64 package. One channel per architecture; see DISTRIBUTION.md.
+      - name: Package
+        shell: pwsh
+        run: |
+          vpk pack --packId Hangly `
+            --packVersion ${{ steps.version.outputs.version }} `
+            --packDir publish --mainExe Hangly.exe `
+            --packTitle Hangly --packAuthors sharancreatedthis `
+            --outputDir releases --runtime ${{ matrix.rid }} --channel ${{ matrix.rid }} `
+            --releaseNotes notes.md
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+
+      - name: Check the feed names its own channel
+        shell: pwsh
+        run: |
+          $feed = "releases/releases.${{ matrix.rid }}.json"
+          if (-not (Test-Path $feed)) {
+            Write-Host "::error::$feed was not produced; the channel was not applied"
+            exit 1
+          }
+          Get-Content $feed -Raw | Write-Host
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: hangly-${{ matrix.rid }}
+          path: releases/
+
+  publish:
+    name: Publish to GitHub Releases
+    needs: package
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The release page says exactly what the app will show on its About page, because
+      # both come out of the same section of CHANGELOG.md.
+      - name: Read the release notes
+        shell: pwsh
+        run: |
+          $version = '${{ github.ref_name }}' -replace '^v', ''
+          ./tools/release-notes.ps1 -Version $version -OutFile notes.md
+
+          # Only the download page needs this. Someone reading the same notes on the
+          # About page has already installed the thing and been warned once.
+          #
+          # Written a line at a time rather than as a here-string: a here-string's
+          # terminator has to sit at the start of its line, and a line at the start of a
+          # line inside a YAML block scalar ends the block. The workflow file stopped
+          # being a workflow file.
+          Add-Content notes.md ''
+          Add-Content notes.md '---'
+          Add-Content notes.md ''
+          Add-Content notes.md '**Code signing for this project is provided by [SignPath Foundation](https://signpath.org/).**'
+          Add-Content notes.md ''
+          Add-Content notes.md 'This build is **not signed yet** -- the application is in progress -- so Windows will show'
+          Add-Content notes.md '"Windows protected your PC" the first time you run it. Click **More info**, then **Run anyway**.'
+          Add-Content notes.md 'Docs/DISTRIBUTION.md explains why, and what changes once the Foundation has signed a release.'
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: staged
+
+      # Both architectures land in one release, side by side. Their feeds are named for
+      # their channels, so an installed copy asks for its own and never sees the other.
+      - name: Publish
+        uses: softprops/action-gh-release@v2
+        with:
+          files: staged/**/*
+          draft: true
+          body_path: notes.md

@@ -1,0 +1,1070 @@
+//
+//  RopeRenderer.cs
+//  Hangly
+//
+//  Drawing the cord, the beads and the charms with Win2D.
+//
+
+using Hangly.Core.Geometry;
+using Hangly.Core.Models;
+using Hangly.Core.Physics;
+using Microsoft.Graphics.Canvas;
+using Microsoft.Graphics.Canvas.Brushes;
+using Microsoft.Graphics.Canvas.Geometry;
+using Windows.UI;
+
+namespace Hangly.App.Overlay;
+
+/// <summary>Draws one frame of the rope.</summary>
+/// <remarks>
+/// A transcription of the macOS <c>RopeStyleRenderer</c>, and deliberately so: every
+/// style is drawn with ordinary strokes of the path the cord already has — a dashed pass
+/// is a twist, a wider flatter pair is a braid, a heavy notch with a lit rim is a chain,
+/// and three progressively wider, fainter strokes are neon's halo.
+///
+/// <para><b>Nothing uses a filter.</b> Win2D has a Gaussian blur effect and it would be
+/// the obvious way to draw a glow. It is not used, for the same reason the original does
+/// not: a blur is an off-screen pass per frame, and at 120 Hz over a window this size it
+/// costs more than the entire solver. Three strokes read the same and cost nothing.</para>
+///
+/// <para>The drawing session is handed in rather than owned, so this class holds no
+/// device resources and survives a device-lost without a rebuild.</para>
+/// </remarks>
+public sealed class RopeRenderer
+{
+    private readonly CharmArtworkCache artwork;
+
+    public RopeRenderer(CharmArtworkCache artwork) => this.artwork = artwork;
+
+    /// <summary>What the charms hanging on the rope are, from the anchor down.</summary>
+    /// <remarks>
+    /// Set from the frame loop. Setting it lets go of the artwork of every charm that is no
+    /// longer hanging; see <see cref="CharmArtworkCache.Retain"/>.
+    /// </remarks>
+    public IReadOnlyList<CharmDescriptor> Charms
+    {
+        get => charms;
+        set
+        {
+            charms = value;
+            artwork.Retain(value.Select(charm => charm.FileName));
+        }
+    }
+
+    private IReadOnlyList<CharmDescriptor> charms = [];
+
+    /// <summary>Appearance → Glow. Set from the frame loop.</summary>
+    /// <remarks>Changing it lets go of every cached glow brush: they are built for one level.</remarks>
+    public GlowLevel Glow
+    {
+        get => glow;
+        set
+        {
+            if (value == glow)
+            {
+                return;
+            }
+
+            glow = value;
+            foreach (CanvasRadialGradientBrush stale in glows.Values)
+            {
+                stale.Dispose();
+            }
+
+            glows.Clear();
+        }
+    }
+
+    private GlowLevel glow = GlowLevel.Soft;
+
+    /// <summary>
+    /// The canvas's height in points, which a charm that hangs by its own drawn rope fills
+    /// down from its top. Zero — the default, for the Library's and the Studio's small
+    /// canvases — hangs it to the rope's end and its own radius.
+    /// </summary>
+    public double CanvasHeight { get; set; }
+
+    /// <summary>How much of the canvas below its top such a charm fills, leaving room for its shadow.</summary>
+    private const double OwnCordFill = 0.96;
+
+    public void Draw(CanvasDrawingSession session, RopeSnapshot snapshot, RopeStyle style)
+    {
+        if (snapshot.Points.Count < 2)
+        {
+            return;
+        }
+
+        session.Antialiasing = CanvasAntialiasing.Antialiased;
+
+        // The Spider-Man entrance's web, behind the rope it hangs from.
+        if (snapshot.Bloom is WebBloom bloom)
+        {
+            DrawWebBloom(session, bloom);
+        }
+
+        // No DPI transform here, and that is the correction to an earlier mistake worth
+        // recording: a CanvasControl's drawing session is already in DIPs, so scaling it
+        // again by the window's DPI drew everything twice its size. On a 200% display the
+        // rope then overshot its canvas and the charm hung below the bottom edge, which
+        // looked like a missing charm rather than an oversized rope.
+        //
+        // The window is sized in physical pixels as points × scale, so the control's DIP
+        // space and the solver's point space are the same space. Nothing to convert.
+        RopeAppearance appearance = RopeStyleAppearanceTable.AppearanceOf(style);
+        double charmRadius = snapshot.Charms.Count > 0 ? snapshot.Charms[^1].Radius : 10;
+        double width = RopeStyleAppearanceTable.WidthFor(style, charmRadius);
+
+        // One piece of cord per gap the charms leave, so a charm's own loop is where the
+        // cord ends rather than something the cord is drawn through.
+        List<List<Vec2>> runs = VisibleRuns(snapshot.Points, snapshot.Charms);
+        DropOwnCordRuns(runs);
+        AddCordReaches(runs, snapshot.Charms);
+        DrawRopeLayer(session, snapshot, runs, appearance, width, charmRadius);
+        DrawBeads(session, snapshot, appearance);
+        DrawCharms(session, snapshot);
+        artwork.EndFrame();
+    }
+
+    /// <summary>A straight length of cord in <paramref name="style"/>, for the Library's rope cards.</summary>
+    /// <remarks>
+    /// The macOS <c>RopeSwatch</c>: drawn by the rope renderer itself rather than pictured,
+    /// so a card can never show a cord the overlay does not draw. Sized against a charm
+    /// larger than anything that hangs — at true proportions every style is a hairline, and
+    /// on a card the texture is the whole thing being chosen between.
+    /// </remarks>
+    public static void DrawSwatch(CanvasDrawingSession session, RopeStyle style, Vec2 top, Vec2 bottom, double charmRadius = 86)
+    {
+        session.Antialiasing = CanvasAntialiasing.Antialiased;
+        RopeAppearance appearance = RopeStyleAppearanceTable.AppearanceOf(style);
+        DrawCord(session, [top, bottom], appearance, RopeStyleAppearanceTable.WidthFor(style, charmRadius), charmRadius, head: false, shadow: false);
+    }
+
+    /// <summary>
+    /// The cord, in the gaps the charms leave. A charm hides the cord it is drawn over,
+    /// so a string of three needs four visible pieces of cord rather than one line with
+    /// three discs on top of it.
+    /// </summary>
+    private static void DrawCord(
+        CanvasDrawingSession session,
+        IReadOnlyList<Vec2> run,
+        RopeAppearance appearance,
+        double width,
+        double charmRadius,
+        bool head,
+        bool shadow = true)
+    {
+        using CanvasPathBuilder builder = BuildSpline(session, run, head);
+        using var path = CanvasGeometry.CreatePath(builder);
+
+        // The glow first and underneath: three progressively wider, fainter strokes. No
+        // blur, for the reason on the type.
+        if (appearance.GlowStrength > 0)
+        {
+            for (int halo = 3; halo >= 1; halo--)
+            {
+                float haloWidth = (float)(width * (1 + (halo * 1.1 * appearance.GlowStrength)));
+                double alpha = appearance.GlowStrength * 0.16 / halo;
+                session.DrawGeometry(path, ToColor(appearance.Palette.Light, alpha), haloWidth);
+            }
+        }
+
+        // A shadow under the cord, falling the same way and the same distance as the
+        // charm's. A cord with no shadow over a charm that has one reads as two objects
+        // lit by different suns.
+        // A shadow gives the cord depth over a desktop; on a card it reads as a smudge.
+        if (shadow)
+        {
+            DrawCordShadow(session, path, width, charmRadius);
+        }
+
+        DrawCylinder(session, path, appearance, width);
+
+        DrawTexture(session, path, appearance, width);
+    }
+
+    /// <summary>The cord as a lit rod rather than a filled line.</summary>
+    /// <remarks>
+    /// <b>Painted across the cord, not out from its middle.</b> Concentric strokes were
+    /// tried first and were wrong in a way that is obvious once measured: they give a
+    /// dark edge on <em>both</em> sides with a light middle, which is a tube lit from the
+    /// front. The shipping macOS cord, read across its width on a white ground, runs
+    /// 216, 166, 113, 109, 74 — light on the left edge, dark on the right, a ramp with no
+    /// bright middle at all. That is a rod lit from one side, and the side is up-and-left,
+    /// which is where the beads are lit from too.
+    ///
+    /// <para>So each pass is offset across the full width rather than nested inside the
+    /// last, and the colour runs Light → Primary → Deep as it crosses. The passes are
+    /// much wider than their spacing so they overlap and antialias into a ramp instead of
+    /// banding — which they did at nine narrow steps on an eight-pixel cord, where each
+    /// step's contribution was less than a pixel.</para>
+    ///
+    /// <para>Offsetting the whole path approximates offsetting along the cord's normal.
+    /// It is a good approximation because the cord hangs within a few degrees of vertical
+    /// almost all the time, and the error at full swing is a fraction of a point.</para>
+    ///
+    /// <para>Nine strokes of a path that is already built costs nothing worth measuring,
+    /// and a settled rope draws none of them.</para>
+    /// </remarks>
+    private static void DrawCylinder(
+        CanvasDrawingSession session,
+        CanvasGeometry path,
+        RopeAppearance appearance,
+        double width)
+    {
+        // The silhouette first, so the ramp above it never leaves a gap at the edges.
+        // Not the deep ink at full strength: measured against macOS, the darkest point
+        // across its cord is 74 of 255, and Deep alone came out at 39.
+        CharmColor rim = CharmColor.Interpolate(appearance.Palette.Deep, appearance.Palette.Primary, 0.3);
+        session.DrawGeometry(path, ToColor(rim, 1), (float)(width * 1.1));
+
+        // Then the cross-section, painted across the cord rather than out from its middle.
+        for (int step = 0; step < CylinderSteps; step++)
+        {
+            double t = step / (double)(CylinderSteps - 1);
+
+            CharmColor ink = t < 0.5
+                ? CharmColor.Interpolate(appearance.Palette.Light, appearance.Palette.Primary, t * 2)
+                : CharmColor.Interpolate(appearance.Palette.Primary, appearance.Palette.Deep, (t - 0.5) * 2);
+
+            DrawOffset(
+                session,
+                path,
+                ToColor(ink, 1),
+                (float)(width * CylinderStrokeWidth),
+                (float)((t - 0.5) * width * CylinderSpread),
+                0);
+        }
+    }
+
+    /// <summary>How many passes the cord's cross-section is walked in.</summary>
+    private const int CylinderSteps = 12;
+
+    /// <summary>Each pass's stroke width, as a fraction of the cord's. Wide, so they overlap.</summary>
+    private const double CylinderStrokeWidth = 0.45;
+
+    /// <summary>How far the passes spread across the cord, as a fraction of its width.</summary>
+    private const double CylinderSpread = 0.62;
+
+    /// <summary>The cord's own drop shadow.</summary>
+    /// <remarks>
+    /// <b>The same light as the charm's.</b> This used to fall down and to the right by a
+    /// fraction of the cord's own width, which is two mistakes: the charm's shadow falls
+    /// straight down, and a couple of points of cord cast a shadow a couple of points
+    /// wide, which never cleared its own edge. It was a dark line along the cord rather
+    /// than a shadow on the desktop, and the report was simply that the rope had none.
+    /// Both now take their fall from the charm's radius through the one ratio, so the
+    /// distance is the same for the cord and for the thing hanging on it.
+    ///
+    /// <para><b>Two passes, not one.</b> The wider, fainter one first and the tighter one
+    /// over it, which is how macOS softens it — "two offset low-alpha passes" — and is
+    /// what antialiasing can give without a blur. A blur is an off-screen pass per frame,
+    /// which this renderer exists to avoid.</para>
+    /// </remarks>
+    private static void DrawCordShadow(
+        CanvasDrawingSession session,
+        CanvasGeometry path,
+        double width,
+        double charmRadius)
+    {
+        // Down and to the right, because the light is up and to the left — the same light
+        // the cord's own shading is painted for, and the beads with it.
+        //
+        // Straight down was tried and is wrong here for a reason worth keeping: the cord
+        // hangs vertical almost all the time, so a shadow directly below it lands exactly
+        // on the cord and is never seen. The charm gets away with falling straight down
+        // because it is a wide disc; a line cannot.
+        //
+        // The distance is the charm's, so one light casts both, and never less than the
+        // cord is wide — below that the shadow is still hidden under its own caster.
+        double distance = Math.Max(charmRadius * CharmShadowOffsetRatio, width * 1.6);
+        var fall = (float)(distance * ShadowDiagonal);
+
+        Color near = Color.FromArgb((byte)Math.Round(255 * CordShadowOpacity), 0, 0, 0);
+        Color far = Color.FromArgb((byte)Math.Round(255 * CordShadowOpacity * 0.55), 0, 0, 0);
+
+        // The wider, fainter pass first and the tighter one over it: two offset low-alpha
+        // strokes are how macOS softens this, and it is what antialiasing can give
+        // without a blur.
+        DrawOffset(session, path, far, (float)(width * 2.1), fall * 1.5f, fall * 1.5f);
+        DrawOffset(session, path, near, (float)(width * 1.35), fall, fall);
+    }
+
+    /// <summary>Strokes the path shifted, without disturbing the caller's transform.</summary>
+    private static void DrawOffset(
+        CanvasDrawingSession session,
+        CanvasGeometry path,
+        Color color,
+        float strokeWidth,
+        float dx,
+        float dy)
+    {
+        System.Numerics.Matrix3x2 previous = session.Transform;
+        session.Transform = System.Numerics.Matrix3x2.CreateTranslation(dx, dy) * previous;
+        session.DrawGeometry(path, color, strokeWidth);
+        session.Transform = previous;
+    }
+
+    /// <summary>
+    /// How dark the cord's shadow is.
+    /// </summary>
+    /// <remarks>
+    /// Lighter than the charm's 0.326. The charm's shadow falls on the desktop well clear
+    /// of the artwork; the cord is a couple of points across, so its shadow lands against
+    /// its own edge, and at the charm's opacity it read as a black outline rather than as
+    /// depth — measured at 36 against macOS's darkest cord reading of 85.
+    /// </remarks>
+    private const double CordShadowOpacity = 0.16;
+
+    /// <summary>
+    /// How far a shadow falls below what casts it, as a fraction of the charm's radius.
+    /// </summary>
+    /// <remarks>
+    /// The charm's number, stated once and used by both. `CharmArtworkCache` owns the
+    /// charm's own shadow and carries the same ratio; if that one moves this must move
+    /// with it, because the whole point is that one light casts both.
+    /// </remarks>
+    private const double CharmShadowOffsetRatio = 0.041;
+
+    /// <summary>One axis of a 45° fall, so a diagonal offset travels the stated distance.</summary>
+    private const double ShadowDiagonal = 0.7071067811865476;
+
+    /// <summary>The pattern worked along the cord.</summary>
+    /// <remarks>
+    /// Skipped entirely below 1.4 points of width, where any pattern turns to mud and the
+    /// only thing a second stroke adds is a slightly dirtier line. That floor is why the
+    /// styles carry a <see cref="RopeAppearance.MinimumWidth"/> at all.
+    /// </remarks>
+    private static void DrawTexture(
+        CanvasDrawingSession session,
+        CanvasGeometry path,
+        RopeAppearance appearance,
+        double width)
+    {
+        if (width < 1.4 || appearance.Texture.Kind == RopeTextureKind.Smooth)
+        {
+            return;
+        }
+
+        RopeTexture texture = appearance.Texture;
+
+        switch (texture.Kind)
+        {
+            case RopeTextureKind.Twist:
+            case RopeTextureKind.Web:
+            {
+                // A dashed pass across the cord reads as the lit side of a twist. The web
+                // is the same idea at a finer pitch and a lighter ink.
+                // CustomDashStyle alone is what makes the dashes custom. CanvasDashStyle
+                // has no Custom member to pair it with — setting the array is the switch.
+                var style = new CanvasStrokeStyle
+                {
+                    CustomDashStyle = [(float)texture.Pitch, (float)texture.Pitch],
+                    DashCap = CanvasCapStyle.Flat,
+                };
+                double inset = width * (1 - texture.Offset);
+                session.DrawGeometry(path, ToColor(appearance.Palette.Light, 0.55), (float)inset, style);
+                break;
+            }
+
+            case RopeTextureKind.Braid:
+            {
+                // Two offset dashed passes, wider and flatter than a twist: the over and
+                // under of a flat braid.
+                var style = new CanvasStrokeStyle
+                {
+                    CustomDashStyle = [(float)texture.Pitch, (float)(texture.Pitch * 0.9)],
+                    DashCap = CanvasCapStyle.Flat,
+                };
+                var offsetStyle = new CanvasStrokeStyle
+                {
+                    CustomDashStyle = [(float)texture.Pitch, (float)(texture.Pitch * 0.9)],
+                    DashOffset = (float)texture.Pitch,
+                    DashCap = CanvasCapStyle.Flat,
+                };
+                double inset = width * (1 - texture.Offset);
+                session.DrawGeometry(path, ToColor(appearance.Palette.Light, 0.40), (float)inset, style);
+                session.DrawGeometry(path, ToColor(appearance.Palette.Secondary, 0.55), (float)inset, offsetStyle);
+                break;
+            }
+
+            case RopeTextureKind.Links:
+            {
+                // A heavy notch with a lit rim: the gap between two links, and the light
+                // catching the near edge of each.
+                var notch = new CanvasStrokeStyle
+                {
+                    CustomDashStyle = [(float)(texture.Pitch * texture.Thickness), (float)texture.Pitch],
+                    DashCap = CanvasCapStyle.Round,
+                };
+                session.DrawGeometry(path, ToColor(appearance.Palette.Deep, 0.85), (float)(width * 1.05), notch);
+                session.DrawGeometry(path, ToColor(appearance.Palette.Light, 0.60), (float)(width * 0.45), notch);
+                break;
+            }
+
+            case RopeTextureKind.Smooth:
+            default:
+                break;
+        }
+    }
+
+    /// <summary>
+    /// The quadratic spline through the node midpoints, with each node as a control
+    /// point — the same curve the solver threads its beads on.
+    /// </summary>
+    /// <param name="head">
+    /// Whether to carry the cord up to the top of the canvas before the first point.
+    /// </param>
+    private static CanvasPathBuilder BuildSpline(
+        CanvasDrawingSession session,
+        IReadOnlyList<Vec2> points,
+        bool head)
+    {
+        var builder = new CanvasPathBuilder(session);
+
+        // The cord starts at the top of the canvas rather than at the anchor. The anchor
+        // sits a hundredth of the canvas down — `RopeConfiguration.Layout.AnchorFraction`
+        // — which on macOS is hidden behind the menu bar the overlay hangs under. Windows
+        // has nothing up there, so that hundredth read as a rope beginning in mid-air a
+        // few pixels below the edge of the screen.
+        //
+        // Drawn rather than simulated: the anchor is a fixed point and the cord above it
+        // cannot move, so this is a straight line up to the edge and no physics changes.
+        //
+        // Only for the piece that starts at the anchor. Every other piece starts under a
+        // charm somewhere down the rope, and giving those a head drew a cord from the top
+        // of the screen down to each of them — one rope per charm, which is exactly what
+        // it looked like.
+        // Prepended rather than drawn as its own line, so the anchor becomes a control
+        // point of the spline and the cord curves into it instead of meeting it at a
+        // corner. The point itself is directly above the anchor and never moves.
+        IReadOnlyList<Vec2> path = head && points[0].Y > 0
+            ? Headed(points)
+            : points;
+
+        builder.BeginFigure(ToVector(path[0]));
+
+        for (int index = 1; index < path.Count - 1; index++)
+        {
+            Vec2 control = path[index];
+            Vec2 finish = (path[index] + path[index + 1]) * 0.5;
+            builder.AddQuadraticBezier(ToVector(control), ToVector(finish));
+        }
+
+        builder.AddLine(ToVector(path[^1]));
+        builder.EndFigure(CanvasFigureLoop.Open);
+        return builder;
+    }
+
+    /// <summary>
+    /// The cord broken into the pieces that are actually visible.
+    /// </summary>
+    /// <remarks>
+    /// <b>A charm's knot is where the cord ends, not something it passes through.</b>
+    /// Each charm hides the cord within its knot circle — <c>radius × knotInset</c>, which
+    /// `CharmStackLayout` names as "the circle the cord disappears behind" and measures
+    /// from the artwork's own loop. Drawing one continuous line and painting the charms
+    /// over it looks the same only while the artwork is solid: a loop is a ring, and the
+    /// cord was visible through the hole in it, running down past the clamp to the
+    /// charm's centre. macOS ends the cord at the top of the loop, and so does this.
+    ///
+    /// <para>Cut in point space rather than by the arc lengths the snapshot already
+    /// carries, because what has to be hidden is a circle on the canvas, and the arc
+    /// where the cord crosses that circle is exactly what this solves for. Each segment
+    /// is clipped against every charm's circle and what is left over is kept.</para>
+    ///
+    /// <para>Twenty segments against three circles, once a frame. The lists are the only
+    /// allocation and they are small; the alternative — one path and a clipping layer per
+    /// charm — is an off-screen pass per charm per frame.</para>
+    /// </remarks>
+    private static List<List<Vec2>> VisibleRuns(
+        IReadOnlyList<Vec2> points,
+        IReadOnlyList<CharmPlacement> charms)
+    {
+        var runs = new List<List<Vec2>>();
+        var current = new List<Vec2>();
+        var hidden = new List<(double Start, double End)>();
+
+        for (int index = 0; index < points.Count - 1; index++)
+        {
+            Vec2 from = points[index];
+            Vec2 to = points[index + 1];
+
+            hidden.Clear();
+            foreach (CharmPlacement charm in charms)
+            {
+                double covered = charm.Radius * charm.KnotInset * KnotCoverage;
+                if (Crossing(from, to, charm.Center, covered) is { } span)
+                {
+                    hidden.Add(span);
+                }
+            }
+
+            hidden.Sort((left, right) => left.Start.CompareTo(right.Start));
+
+            // Walk the segment, emitting what is not covered and breaking the run
+            // wherever something is.
+            double at = 0;
+            foreach ((double start, double end) in hidden)
+            {
+                if (end <= at)
+                {
+                    continue;
+                }
+
+                if (start > at)
+                {
+                    current.Add(Lerp(from, to, at));
+                    current.Add(Lerp(from, to, start));
+                    Finish(runs, ref current);
+                }
+                else if (current.Count > 0)
+                {
+                    Finish(runs, ref current);
+                }
+
+                at = end;
+            }
+
+            if (at < 1)
+            {
+                current.Add(Lerp(from, to, at));
+            }
+            else
+            {
+                Finish(runs, ref current);
+            }
+        }
+
+        if (points.Count > 0 && current.Count > 0)
+        {
+            current.Add(points[^1]);
+        }
+
+        Finish(runs, ref current);
+        return runs;
+    }
+
+    /// <summary>
+    /// The cord on past the knot, for a charm whose cord meets its artwork lower than it
+    /// can be hung from — straight down the charm's axis and behind it, so it shows only
+    /// through what the artwork leaves open: between a Snitch's wings, to the ball. macOS's
+    /// <c>RopeCanvasView.cordReach</c>.
+    /// </summary>
+    private void AddCordReaches(List<List<Vec2>> runs, IReadOnlyList<CharmPlacement> placements)
+    {
+        for (int slot = 0; slot < placements.Count && slot < charms.Count; slot++)
+        {
+            CharmPlacement placement = placements[slot];
+            if (charms[slot].CordInset is not double inset || inset >= placement.KnotInset)
+            {
+                continue;
+            }
+
+            var direction = new Vec2(Math.Cos(placement.Angle), Math.Sin(placement.Angle));
+            runs.Add(
+            [
+                placement.Center - (direction * (placement.Radius * placement.KnotInset)),
+                placement.Center - (direction * (placement.Radius * inset)),
+            ]);
+        }
+    }
+
+    /// <summary>
+    /// The cord in a layer of its own, with every charm's silhouette taken out of it before
+    /// it is laid down: not one rope pixel shows through a charm or rings its edge, and it
+    /// is seen only where a charm is open — through a hook, between a Snitch's wings.
+    /// </summary>
+    /// <remarks>
+    /// The layer covers the cord and nothing more, so it costs what the cord does rather
+    /// than a full-canvas pass, and it is kept from frame to frame while it is big enough.
+    /// </remarks>
+    private void DrawRopeLayer(
+        CanvasDrawingSession session,
+        RopeSnapshot snapshot,
+        List<List<Vec2>> runs,
+        RopeAppearance appearance,
+        double width,
+        double charmRadius)
+    {
+        double minX = double.MaxValue, minY = double.MaxValue, maxX = double.MinValue, maxY = double.MinValue;
+        foreach (List<Vec2> run in runs)
+        {
+            foreach (Vec2 point in run)
+            {
+                minX = Math.Min(minX, point.X);
+                minY = Math.Min(minY, point.Y);
+                maxX = Math.Max(maxX, point.X);
+                maxY = Math.Max(maxY, point.Y);
+            }
+        }
+
+        if (minX > maxX)
+        {
+            return;
+        }
+
+        // Room for the cord's glow and shadow either side of its line.
+        double margin = (width * 6) + 4;
+        var origin = new Vec2(Math.Floor(minX - margin), Math.Floor(minY - margin));
+        float layerWidth = (float)Math.Ceiling(maxX + margin - origin.X);
+        float layerHeight = (float)Math.Ceiling(maxY + margin - origin.Y);
+
+        if (ropeLayer is null
+            || ropeLayer.Device != session.Device
+            || ropeLayer.Size.Width < layerWidth
+            || ropeLayer.Size.Height < layerHeight
+            || !ropeLayer.Dpi.Equals(session.Dpi))
+        {
+            // Grown, never shrunk, so a swinging rope settles on one layer size.
+            float keepWidth = ropeLayer is not null && ropeLayer.Device == session.Device ? (float)ropeLayer.Size.Width : 0;
+            float keepHeight = ropeLayer is not null && ropeLayer.Device == session.Device ? (float)ropeLayer.Size.Height : 0;
+            ropeLayer?.Dispose();
+            ropeLayer = new CanvasRenderTarget(session, Math.Max(layerWidth, keepWidth), Math.Max(layerHeight, keepHeight));
+        }
+
+        using (CanvasDrawingSession layer = ropeLayer.CreateDrawingSession())
+        {
+            layer.Clear(Microsoft.UI.Colors.Transparent);
+            layer.Antialiasing = CanvasAntialiasing.Antialiased;
+            layer.Transform = System.Numerics.Matrix3x2.CreateTranslation(-(float)origin.X, -(float)origin.Y);
+            for (int index = 0; index < runs.Count; index++)
+            {
+                DrawCord(layer, runs[index], appearance, width, charmRadius, head: index == 0);
+            }
+
+            for (int index = 0; index < snapshot.Charms.Count && index < Charms.Count; index++)
+            {
+                artwork.EraseBehind(layer, Charms[index], HangFor(snapshot, index));
+            }
+        }
+
+        session.DrawImage(
+            ropeLayer,
+            new Windows.Foundation.Rect(origin.X, origin.Y, ropeLayer.Size.Width, ropeLayer.Size.Height),
+            new Windows.Foundation.Rect(0, 0, ropeLayer.Size.Width, ropeLayer.Size.Height));
+    }
+
+    /// <summary>The offscreen layer the cord is drawn in; see <see cref="DrawRopeLayer"/>.</summary>
+    private CanvasRenderTarget? ropeLayer;
+
+    /// <summary>
+    /// Where a charm is drawn: at its place on the rope, turned with the cord that meets it
+    /// — or, for a charm that hangs by its own drawn rope, from where our cord would have
+    /// started, down past its place by its radius, as macOS's <c>RopeCanvasView.hang</c>.
+    /// </summary>
+    private CharmHang HangFor(RopeSnapshot snapshot, int slot)
+    {
+        CharmPlacement placement = snapshot.Charms[slot];
+        var resting = new CharmHang(placement.Center, placement.Radius, placement.Angle - (Math.PI / 2));
+        if (slot >= Charms.Count || !Charms[slot].HangsByOwnCord || Charms[slot].Body.Height <= 0)
+        {
+            return resting;
+        }
+
+        Rect body = Charms[slot].Body;
+        Vec2 top = slot == 0 ? snapshot.Points[0] : snapshot.Charms[slot - 1].Center;
+        Vec2 reach = placement.Center - top;
+        double distance = reach.Magnitude;
+        if (distance <= 1)
+        {
+            return resting;
+        }
+
+        Vec2 direction = reach / distance;
+
+        // Down as far as the canvas allows: it is one tall picture, five times taller than
+        // wide, so stopping at the rope's end left both figures a few dozen points across.
+        double height = Math.Max(distance + placement.Radius, (CanvasHeight - top.Y) * OwnCordFill);
+        double longest = Math.Max(body.Width, body.Height);
+        return new CharmHang(
+            top + (direction * (height / 2)),
+            height / 2 * longest / body.Height,
+            Math.Atan2(direction.Y, direction.X) - (Math.PI / 2));
+    }
+
+    /// <summary>
+    /// No cord of ours into a charm that hangs by the rope in its own artwork: the run that
+    /// leads to it — the first for the first charm, the next for the next — is dropped.
+    /// </summary>
+    private void DropOwnCordRuns(List<List<Vec2>> runs)
+    {
+        for (int slot = Math.Min(Charms.Count, runs.Count) - 1; slot >= 0; slot--)
+        {
+            if (Charms[slot].HangsByOwnCord)
+            {
+                runs.RemoveAt(slot);
+            }
+        }
+    }
+
+    /// <summary>Closes off the run being built, keeping it only if it is worth stroking.</summary>
+    private static void Finish(List<List<Vec2>> runs, ref List<Vec2> current)
+    {
+        if (current.Count >= 2)
+        {
+            runs.Add(current);
+            current = [];
+            return;
+        }
+
+        current.Clear();
+    }
+
+    /// <summary>
+    /// Where a segment is inside a circle, as a pair of fractions along it, or null.
+    /// </summary>
+    private static (double Start, double End)? Crossing(Vec2 from, Vec2 to, Vec2 center, double radius)
+    {
+        if (radius <= 0)
+        {
+            return null;
+        }
+
+        Vec2 along = to - from;
+        Vec2 offset = from - center;
+
+        double a = (along.X * along.X) + (along.Y * along.Y);
+        if (a <= Precision.UlpOfOne)
+        {
+            return null;
+        }
+
+        double b = 2 * ((offset.X * along.X) + (offset.Y * along.Y));
+        double c = (offset.X * offset.X) + (offset.Y * offset.Y) - (radius * radius);
+
+        double discriminant = (b * b) - (4 * a * c);
+        if (discriminant <= 0)
+        {
+            return null;
+        }
+
+        double root = Math.Sqrt(discriminant);
+        double first = Math.Max(0, (-b - root) / (2 * a));
+        double second = Math.Min(1, (-b + root) / (2 * a));
+
+        return second <= first ? null : (first, second);
+    }
+
+    private static Vec2 Lerp(Vec2 from, Vec2 to, double at) => from + ((to - from) * at);
+
+    /// <summary>The cord's nodes with the point it leaves the screen by in front.</summary>
+    /// <remarks>
+    /// <b>Directly above the anchor, and fixed there.</b> The anchor sits a hundredth of
+    /// the canvas down — <c>RopeConfiguration.Layout.AnchorFraction</c> — which on macOS
+    /// is hidden behind the menu bar the overlay hangs under. Windows has nothing up
+    /// there, so that hundredth read as a rope beginning in mid-air a few pixels below the
+    /// edge of the screen. This closes it.
+    ///
+    /// <para><b>Why it does not follow the rope.</b> It did, briefly: the head was
+    /// extended along the first segment's own direction so the join would be collinear and
+    /// show no fold. But the first segment swings, and a head that follows it slides along
+    /// the top edge every frame — the cord's end wandering across the screen instead of
+    /// staying where it is pinned. Worse near horizontal, where the distance to the edge
+    /// divided by a vanishing vertical component sends it a long way sideways and then
+    /// snaps it back when the cap catches it.</para>
+    ///
+    /// <para>The anchor is a fixed point, so what is above it is a fixed point too. The
+    /// fold that motivated following the rope is gone anyway: this is prepended to the
+    /// spline rather than drawn as a straight line to the anchor, which makes the anchor a
+    /// control point and turns the corner into a curve.</para>
+    /// </remarks>
+    private static IReadOnlyList<Vec2> Headed(IReadOnlyList<Vec2> points)
+    {
+        var path = new List<Vec2>(points.Count + 1) { new(points[0].X, 0) };
+        path.AddRange(points);
+        return path;
+    }
+
+    /// <summary>
+    /// How much of the knot circle the cord is cut back by, as a fraction of it.
+    /// </summary>
+    /// <remarks>
+    /// <b>The measured circle, and no less.</b> This was 0.82 for a while, on the
+    /// reasoning that the charm is drawn after the cord so cord running <em>under</em> the
+    /// artwork is invisible while cord stopping short of it is a gap — err into the charm,
+    /// and only the gap can ever be seen.
+    ///
+    /// <para>That reasoning holds only where the artwork is opaque, and at the clamp it is
+    /// not: the loop a charm hangs by is a ring with a hole in it, so cord pushed past the
+    /// clamp shows straight through and runs on down across the charm's face. macOS ends
+    /// the cord at the clamp's edge and the difference was plain with the two side by
+    /// side.</para>
+    /// </remarks>
+    private const double KnotCoverage = 1.0;
+
+    /// <summary>The beads on the cord, drawn from the artwork they were measured in.</summary>
+    /// <remarks>
+    /// Each bead is a region of its charm's own SVG. The splitter already measured those
+    /// rectangles — it is how the solver knows a bead's size, place and weight — and this
+    /// used to throw them away and fill an ellipse instead, which is why a Nazar's three
+    /// gold beads arrived as one flat oval: they touch, so they are one measured run, and
+    /// only the artwork knows there are three of them in it.
+    ///
+    /// <para>The ellipse survives as the fallback for a charm whose artwork could not be
+    /// split — an import with no measured beads, or an asset that does not match what the
+    /// catalogue claims. Those have no bead artwork to draw, and a drawn bead is better
+    /// than a gap in the cord.</para>
+    /// </remarks>
+    private void DrawBeads(CanvasDrawingSession session, RopeSnapshot snapshot, RopeAppearance appearance)
+    {
+        // Beads arrive grouped by the charm that threads them, in the order that charm's
+        // regions were measured, so the run of each owner counts its own way through.
+        int ordinal = 0;
+        int owner = -1;
+
+        foreach (BeadPlacement bead in snapshot.Beads)
+        {
+            if (bead.Owner != owner)
+            {
+                owner = bead.Owner;
+                ordinal = 0;
+            }
+
+            CharmDescriptor? charm = bead.Owner >= 0 && bead.Owner < Charms.Count
+                ? Charms[bead.Owner]
+                : null;
+
+            if (charm is not null && ordinal < charm.BeadRegions.Count)
+            {
+                artwork.DrawBead(session, charm, bead, charm.BeadRegions[ordinal]);
+            }
+            else
+            {
+                DrawPlainBead(session, appearance, bead);
+            }
+
+            ordinal++;
+        }
+    }
+
+    /// <summary>A bead for a charm whose artwork could not be measured.</summary>
+    private static void DrawPlainBead(
+        CanvasDrawingSession session,
+        RopeAppearance appearance,
+        BeadPlacement bead)
+    {
+        CharmPalette palette = appearance.BeadTint ?? appearance.Palette;
+        var center = ToVector(bead.Position);
+
+        session.FillEllipse(
+            center,
+            (float)(bead.Size.Width / 2),
+            (float)(bead.Size.Height / 2),
+            ToColor(palette.Primary, 1));
+
+        // One highlight up and left of centre, which is where the light is in every
+        // piece of this artwork.
+        session.FillEllipse(
+            new System.Numerics.Vector2(
+                center.X - (float)(bead.Size.Width * 0.16),
+                center.Y - (float)(bead.Size.Height * 0.18)),
+            (float)(bead.Size.Width * 0.18),
+            (float)(bead.Size.Height * 0.16),
+            ToColor(palette.Light, 0.75));
+    }
+
+    /// <summary>Strokes the entrance's web, from the top edge to the rope: silk-white threads over a faint dark underline, so it reads on a white window as well as a dark wallpaper.</summary>
+    /// <remarks>
+    /// Drawn from the web's fixed pattern each frame that is drawn at all — a settled rope draws
+    /// none — as short straight lines, so nothing is allocated per frame and nothing is kept. The same strokes, widths and
+    /// alphas as macOS's <c>WebBloomRenderer</c>.
+    /// </remarks>
+    private static void DrawWebBloom(CanvasDrawingSession session, WebBloom bloom)
+    {
+        if (bloom.Growth <= 0.001)
+        {
+            return;
+        }
+
+        using var round = new CanvasStrokeStyle { StartCap = CanvasCapStyle.Round, EndCap = CanvasCapStyle.Round };
+        Color shadow = Color.FromArgb((byte)Math.Round(255 * 0.22), 0, 0, 0);
+        Color silk = Color.FromArgb((byte)Math.Round(255 * 0.92), 255, 255, 255);
+        IReadOnlyList<WebBloom.Thread> threads = bloom.Threads;
+
+        // Every underline first, then every thread, so no shadow falls across silk.
+        foreach (bool isShadow in new[] { true, false })
+        {
+            foreach (WebBloom.Thread thread in threads)
+            {
+                // Four straight pieces along the curve, joined by round caps: indistinguishable
+                // from the curve at these sizes, and no geometry object to build per frame.
+                float width = (float)(isShadow ? thread.Width + 1.1 : thread.Width);
+                Vec2 previous = thread.Start;
+                for (int piece = 1; piece <= 4; piece++)
+                {
+                    Vec2 next = thread.At(piece / 4.0);
+                    session.DrawLine(ToVector(previous), ToVector(next), isShadow ? shadow : silk, width, round);
+                    previous = next;
+                }
+            }
+        }
+    }
+
+    private void DrawCharms(CanvasDrawingSession session, RopeSnapshot snapshot)
+    {
+        // Every glow first, then every charm. Interleaved, the second charm's glow would
+        // be painted over the first charm's artwork — a glow reaches 1.7 radii and three
+        // charms on one cord are closer together than that — and a charm seen through its
+        // neighbour's colour is not what any of this is for.
+        for (int index = 0; index < snapshot.Charms.Count; index++)
+        {
+            DrawAmbientGlow(
+                session,
+                index < Charms.Count ? Charms[index] : null,
+                snapshot.Charms[index]);
+        }
+
+        for (int index = 0; index < snapshot.Charms.Count; index++)
+        {
+            CharmPlacement placement = snapshot.Charms[index];
+            CharmDescriptor? descriptor = index < Charms.Count ? Charms[index] : null;
+
+            // There used to be an ambient halo here: a filled disc of 1.7 radii at 6%
+            // alpha in the charm's own light colour. It is gone, and nothing replaces it
+            // in that role, because the original has no such thing. What it actually did
+            // was put a hard-edged circle behind every charm — visible in every screenshot
+            // of this build and in none of macOS. The depth it was reaching for is the
+            // drop shadow, which CharmArtworkCache now casts from the artwork's alpha.
+            //
+            // CharmHaloExtent still sizes the canvas. That is a separate job: it is the
+            // headroom the layout reserves below the lowest charm, and the shadow and the
+            // swing both need it.
+            artwork.Draw(session, descriptor, HangFor(snapshot, index));
+        }
+    }
+
+    /// <summary>The charm's own colour, spilling onto what is behind it.</summary>
+    /// <remarks>
+    /// <b>A radial gradient, which is the whole difference.</b> There was a filled disc
+    /// here once, at 1.7 radii and six per cent, and it was removed because a hard-edged
+    /// circle behind every charm is visible in every screenshot and is in none of macOS.
+    /// Removing it was half right: macOS has no disc, but it does have this — "the
+    /// ambient glow is a radial gradient" — and with the disc gone the Windows charm sat
+    /// on the desktop with nothing around it but its drop shadow.
+    ///
+    /// <para><b>Measured, against the two builds side by side on the same white window at
+    /// the same size.</b> Reading outward from the edge of the shield, macOS runs 209,
+    /// 227, 242, 251, 255 over about sixty-five points and is warm the whole way — its
+    /// green and blue are five to nine darker than its red, which is the charm's own red
+    /// laid over white. Windows ran 217, 236, 248, 254, 255 over thirty-three and was
+    /// neutral grey at every step: a drop shadow and nothing else.</para>
+    ///
+    /// <para>The colour is the charm's <c>Primary</c> rather than its <c>Light</c>,
+    /// because on white a glow can only show as a tint and <c>Light</c> is very nearly
+    /// white for most of the catalogue. Drawn under the charm and under its shadow, so
+    /// neither is tinted by it.</para>
+    /// </remarks>
+    private void DrawAmbientGlow(
+        CanvasDrawingSession session,
+        CharmDescriptor? descriptor,
+        CharmPlacement placement)
+    {
+        if (descriptor is null || placement.Radius <= 0 || GlowTable.StrengthOf(glow) is not GlowStrength strength)
+        {
+            return;
+        }
+
+        CanvasRadialGradientBrush brush = GlowFor(session, descriptor, strength);
+        var reach = (float)(placement.Radius * RopeConfiguration.Layout.CharmHaloExtent);
+
+        brush.Center = ToVector(placement.Center);
+        brush.RadiusX = reach;
+        brush.RadiusY = reach;
+
+        session.FillCircle(ToVector(placement.Center), reach, brush);
+    }
+
+    /// <summary>The glow brush for one charm, made once and kept.</summary>
+    /// <remarks>
+    /// Cached because a gradient brush is a device resource and building three of them
+    /// sixty times a second is exactly the per-frame cost this renderer is written to
+    /// avoid. Keyed by the charm rather than by its colour, because the rope carries at
+    /// most three and a charm is what changes.
+    ///
+    /// <para>The device is held alongside them so a lost device is noticed: the brushes
+    /// belong to it, and one that outlived its device would fail on the next frame rather
+    /// than be rebuilt.</para>
+    /// </remarks>
+    private CanvasRadialGradientBrush GlowFor(CanvasDrawingSession session, CharmDescriptor descriptor, GlowStrength strength)
+    {
+        if (!ReferenceEquals(glowDevice, session.Device))
+        {
+            foreach (CanvasRadialGradientBrush stale in glows.Values)
+            {
+                stale.Dispose();
+            }
+
+            glows.Clear();
+            glowDevice = session.Device;
+        }
+
+        if (glows.TryGetValue(descriptor.Id, out CanvasRadialGradientBrush? brush))
+        {
+            return brush;
+        }
+
+        // Shaped rather than linear. A straight ramp from the centre to the full reach
+        // matched macOS where it meets the charm and then would not let go: measured
+        // against the same shield, ours was still nine counts dark sixty-five points out
+        // where macOS was back to the colour of the window. The stops keep the ramp as it
+        // was up to the charm's own edge and then bring it down, so the glow dies about a
+        // third of a radius past the artwork, which is where macOS's dies.
+        //
+        // A stronger level keeps that shape and draws it wider and deeper: every stop
+        // past the charm's edge moves out in proportion to how much further this level
+        // reaches than Soft — a factor of exactly one at Soft, so Soft is the gradient
+        // above to the bit — and every alpha is multiplied by the level's intensity.
+        CharmColor tint = descriptor.Palette.Primary;
+        double widen = (strength.Reach - 1) / (GlowTable.StrengthOf(GlowLevel.Soft)!.Value.Reach - 1);
+        double opacity = GlowOpacity * strength.Intensity;
+        float Out(float softPosition)
+        {
+            double extent = RopeConfiguration.Layout.CharmHaloExtent;
+            return (float)Math.Min(1, (1 + (((softPosition * extent) - 1) * widen)) / extent);
+        }
+
+        CanvasGradientStop[] stops =
+        [
+            new() { Position = 0, Color = ToColor(tint, Math.Min(1, opacity)) },
+            new() { Position = CharmEdge, Color = ToColor(tint, Math.Min(1, opacity * 0.41)) },
+            new() { Position = Out(0.70f), Color = ToColor(tint, Math.Min(1, opacity * 0.17)) },
+            new() { Position = Out(0.79f), Color = ToColor(tint, 0) },
+            new() { Position = 1, Color = ToColor(tint, 0) },
+        ];
+
+        brush = new CanvasRadialGradientBrush(session, stops);
+
+        glows[descriptor.Id] = brush;
+        return brush;
+    }
+
+    /// <summary>
+    /// How much of the charm's colour reaches the desktop at the centre of the glow.
+    /// </summary>
+    /// <remarks>
+    /// Chosen to land on the macOS profile in the remarks on
+    /// <see cref="DrawAmbientGlow"/> once the drop shadow is added to it, not picked for
+    /// looking about right. The gradient is linear in alpha, so what shows just outside
+    /// the charm is this multiplied by the fraction of the reach still to go.
+    /// </remarks>
+    private const double GlowOpacity = 0.19;
+
+    /// <summary>Where the charm's own edge falls inside the glow, as a fraction of it.</summary>
+    /// <remarks>
+    /// The glow reaches <c>CharmHaloExtent</c> radii, so the artwork ends exactly one over
+    /// that. Written as the reciprocal rather than as 0.588 so it follows the layout's
+    /// number if that ever moves.
+    /// </remarks>
+    private const float CharmEdge = (float)(1 / RopeConfiguration.Layout.CharmHaloExtent);
+
+    private readonly Dictionary<string, CanvasRadialGradientBrush> glows = [];
+    private CanvasDevice? glowDevice;
+
+    private static System.Numerics.Vector2 ToVector(Vec2 point) => new((float)point.X, (float)point.Y);
+
+    private static Color ToColor(CharmColor color, double alpha) => Color.FromArgb(
+        (byte)Math.Clamp(color.Alpha * alpha * 255, 0, 255),
+        (byte)Math.Clamp(color.Red * 255, 0, 255),
+        (byte)Math.Clamp(color.Green * 255, 0, 255),
+        (byte)Math.Clamp(color.Blue * 255, 0, 255));
+}

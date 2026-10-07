@@ -1,0 +1,213 @@
+//
+//  CharmArtworkSplitterTests.cs
+//  Hangly.Core.Tests
+//
+
+using Hangly.Core.Geometry;
+using Hangly.Core.Models;
+using Xunit;
+
+namespace Hangly.Core.Tests;
+
+/// <summary>
+/// The splitter against a silhouette the test draws itself: a thin cord down the top,
+/// one bead threaded on it, then a wide body. Drawing the input rather than loading an
+/// asset is the point — it is the one way to know what the answer should be.
+/// </summary>
+public class CharmArtworkSplitterTests
+{
+    private const int Side = CharmArtworkSplitter.AnalysisPixels;
+
+    /// <summary>Content spans x 60–260 of 320, so the cord threshold is measured against that.</summary>
+    private const double ContentWidth = 201.0 / Side;
+
+    private static byte[] Artwork()
+    {
+        var mask = new byte[Side * Side];
+
+        // A cord 6px wide: well under 0.085 × 201 ≈ 17px, so it is never a solid run.
+        Fill(mask, 157, 0, 162, 125);
+
+        // One bead, 41px wide.
+        Fill(mask, 140, 30, 180, 70);
+
+        // The charm: wider than it is tall, so the knot inset is not trivially 1.
+        Fill(mask, 60, 120, 260, 240);
+        return mask;
+    }
+
+    private static void Fill(byte[] mask, int left, int top, int right, int bottom)
+    {
+        for (int y = top; y <= bottom; y++)
+        {
+            for (int x = left; x <= right; x++)
+            {
+                mask[(y * Side) + x] = 255;
+            }
+        }
+    }
+
+    private static CharmArtworkRegions Split(int beadCount = 1, int bodyRun = 1) =>
+        CharmArtworkSplitter.Split(Artwork(), Side, ContentWidth, beadCount, bodyRun)
+        ?? throw new InvalidOperationException("the splitter refused a silhouette it should read");
+
+    [Fact(DisplayName = "The cord is not mistaken for a bead")]
+    public void CordIsNotSolid() => Assert.Single(Split().Beads);
+
+    /// <summary>
+    /// The one that catches an upside-down read. Row zero has to be the top of the
+    /// artwork; if that ever inverts, every charm hangs by its feet.
+    /// </summary>
+    [Fact(DisplayName = "The bead is found above the body, not below it")]
+    public void BeadSitsAboveTheBody()
+    {
+        CharmArtworkRegions regions = Split();
+        Assert.True(regions.Beads[0].Top < regions.Body.Top);
+        Assert.True(regions.Beads[0].Bottom <= regions.Body.Top);
+    }
+
+    [Fact(DisplayName = "The bead's bounds hug the bead")]
+    public void BeadBoundsAreMeasured()
+    {
+        Rect bead = Split().Beads[0];
+        Assert.Equal(140.0 / Side, bead.Left, 6);
+        Assert.Equal(30.0 / Side, bead.Top, 6);
+        Assert.Equal(41.0 / Side, bead.Width, 6);
+        Assert.Equal(41.0 / Side, bead.Height, 6);
+    }
+
+    [Fact(DisplayName = "The body runs from its own solid part to the last ink")]
+    public void BodyBoundsAreMeasured()
+    {
+        Rect body = Split().Body;
+        Assert.Equal(60.0 / Side, body.Left, 6);
+        Assert.Equal(120.0 / Side, body.Top, 6);
+        Assert.Equal(201.0 / Side, body.Width, 6);
+        Assert.Equal(121.0 / Side, body.Height, 6);
+    }
+
+    /// <summary>
+    /// The cord arrives down the body's centre line onto solid artwork deep enough to be
+    /// tied to, so it tucks eight rows in: the knot sits on row 128, half a pixel into it,
+    /// rather than at the box top on row 120 — two times 8.5 rows less than the body.
+    /// </summary>
+    private const double TuckedKnotInset = (121.0 - 17.0) / 201.0;
+
+    [Fact(DisplayName = "The knot is measured where the cord meets the body, tucked in")]
+    public void KnotInsetIsMeasured() =>
+        Assert.Equal(TuckedKnotInset, Split().KnotInset, 6);
+
+    private static byte[] Mask(params (int Left, int Top, int Right, int Bottom)[] parts)
+    {
+        var mask = new byte[Side * Side];
+        foreach ((int left, int top, int right, int bottom) in parts)
+        {
+            Fill(mask, left, top, right, bottom);
+        }
+
+        return mask;
+    }
+
+    private static CharmArtworkRegions SplitWhole(byte[] mask) =>
+        CharmArtworkSplitter.Split(mask, Side, 1, 0, 0)
+        ?? throw new InvalidOperationException("the splitter refused a silhouette it should read");
+
+    [Fact(DisplayName = "A figure's cord meets its head, not the air between its ears")]
+    public void KnotFindsTheHead()
+    {
+        // Two ears set the box top at row 0; the head between them starts at row 84.
+        CharmArtworkRegions regions = SplitWhole(Mask((32, 0, 76, 100), (244, 0, 288, 100), (60, 84, 260, 319)));
+
+        Assert.Equal(0, regions.Body.Top, 6);
+        Assert.InRange(regions.KnotY!.Value * Side, 84, 94);
+    }
+
+    [Fact(DisplayName = "A cord threads a hook to the charm it holds")]
+    public void CordThreadsTheHook()
+    {
+        // A ring whose hole is a hook's — rows 14 to 30 — over a body from row 40.
+        CharmArtworkRegions regions = SplitWhole(Mask(
+            (140, 10, 180, 13), (140, 10, 147, 34), (173, 10, 180, 34), (140, 31, 180, 34), (60, 40, 260, 319)));
+
+        // Through the ring and its hole, and tucked into the body below.
+        Assert.Equal(48.5, regions.KnotY!.Value * Side, 6);
+        Assert.Equal(10.0 / Side, regions.Body.Top, 6);
+    }
+
+    [Fact(DisplayName = "A cord stops in a ring above an opening too big to thread")]
+    public void KnotStopsAtAnOpenRing()
+    {
+        // The ring's two sides either side of a gap on the centre line, over a body below.
+        CharmArtworkRegions regions = SplitWhole(Mask((146, 10, 153, 50), (167, 10, 174, 50), (60, 70, 260, 319)));
+
+        Assert.Equal(10.5, regions.KnotY!.Value * Side, 6);
+    }
+
+    [Fact(DisplayName = "A charm the cord meets past its centre hangs above it, and the cord goes on")]
+    public void CordReachesPastTheCentre()
+    {
+        // Two wings up the sides and a ball at the bottom: the centre line meets nothing
+        // until the ball, below the middle, as a Snitch's does.
+        CharmArtworkRegions regions = SplitWhole(Mask((26, 0, 64, 190), (256, 0, 294, 190), (110, 220, 210, 319)));
+
+        Assert.True(regions.CordInset < 0, $"cord inset {regions.CordInset}");
+        Assert.Equal(CharmArtworkRegions.MinimumKnotInset, regions.KnotInset);
+    }
+
+    [Fact(DisplayName = "A cord stops in a loop's wall above an opening too big to thread")]
+    public void KnotTucksIntoALoop()
+    {
+        // A loop whose top wall is rows 10–19 on the centre line, its hole below.
+        CharmArtworkRegions regions = SplitWhole(Mask((140, 10, 180, 19), (140, 10, 147, 50), (173, 10, 180, 50), (60, 70, 260, 319)));
+
+        Assert.InRange(regions.KnotY!.Value * Side, 11, 16);
+    }
+
+    [Fact(DisplayName = "Asking for no beads leaves the body where it is")]
+    public void ZeroBeadsStillFindsTheBody()
+    {
+        // bodyRun 1 still: the bead's run is cord furniture now, and is dropped rather
+        // than drawn, which is what a thick-corded charm does.
+        CharmArtworkRegions regions = Split(beadCount: 0, bodyRun: 1);
+        Assert.Empty(regions.Beads);
+        Assert.Equal(120.0 / Side, regions.Body.Top, 6);
+    }
+
+    [Fact(DisplayName = "Artwork without the parts the catalogue expects is refused, not guessed at")]
+    public void MissingRunsReturnNull()
+    {
+        Assert.Null(CharmArtworkSplitter.Split(Artwork(), Side, ContentWidth, beadCount: 1, bodyRun: 5));
+        Assert.Null(CharmArtworkSplitter.Split(Artwork(), Side, ContentWidth, beadCount: -1, bodyRun: 0));
+        Assert.Null(CharmArtworkSplitter.Split(Artwork(), Side, ContentWidth, beadCount: 3, bodyRun: 1));
+        Assert.Null(CharmArtworkSplitter.Split([], 0, ContentWidth, beadCount: 0, bodyRun: 0));
+    }
+
+    [Fact(DisplayName = "A measured bead becomes a bead the rope can carry")]
+    public void BeadsBecomePhysics()
+    {
+        CharmCatalogEntry charm = CharmCatalog.Find("nazar");
+        IReadOnlyList<CharmBead> beads = CharmCatalog.BeadsFor(charm, Split());
+
+        CharmBead bead = Assert.Single(beads);
+
+        // Sizes are multiples of the charm's radius, and the body is two radii across.
+        double scale = 2 / (201.0 / Side);
+        Assert.Equal(41.0 / Side * scale, bead.Size.Width, 6);
+
+        // Above the knot, so it rides the cord rather than the charm.
+        Assert.True(bead.Offset > 0);
+        Assert.True(bead.Mass >= CharmCatalog.MinimumBeadMass);
+    }
+
+    [Fact(DisplayName = "The knot comes from the artwork once it has been measured")]
+    public void MetricsTakeTheMeasuredKnot()
+    {
+        CharmCatalogEntry charm = CharmCatalog.Find("nazar");
+        CharmMetrics metrics = CharmCatalog.MetricsFor(charm, Split());
+
+        Assert.Equal(charm.Mass, metrics.Mass);
+        Assert.Equal(charm.RadiusRatio, metrics.RadiusRatio);
+        Assert.Equal(TuckedKnotInset, metrics.KnotInset, 6);
+        Assert.NotEqual(CharmCatalog.FallbackKnotInset, metrics.KnotInset);
+    }
+}

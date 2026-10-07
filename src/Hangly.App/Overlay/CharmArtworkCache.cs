@@ -1,0 +1,978 @@
+//
+//  CharmArtworkCache.cs
+//  Hangly
+//
+//  Charm artwork: SVG in, a bitmap at exactly the size this frame needs out.
+//
+
+using Hangly.Core.Geometry;
+using Hangly.Core.Models;
+using Hangly.Core.Physics;
+using Microsoft.Graphics.Canvas;
+using SkiaSharp;
+using Svg.Skia;
+
+namespace Hangly.App.Overlay;
+
+/// <summary>One charm in the catalogue: its artwork, its physics and its palette.</summary>
+/// <param name="Id">Stable identifier, used in the settings document.</param>
+/// <param name="DisplayName">What the menu calls it.</param>
+/// <param name="FileName">Its SVG, inside the Charms folder.</param>
+/// <param name="Metrics">What the rope has to carry.</param>
+/// <param name="Palette">Its four inks.</param>
+/// <param name="Beads">What it threads on the cord above it.</param>
+/// <param name="Body">
+/// Which part of the artwork is the charm itself, in the fitted unit square, as measured
+/// by <see cref="CharmArtworkSplitter"/>. The whole square when the artwork could not be
+/// measured — drawing the beads in as well is a better failure than drawing nothing.
+/// </param>
+/// <param name="BeadRegions">
+/// Where each bead's own artwork lives, in the same fitted unit square, in the order the
+/// solver is given them. This is what makes a bead the picture the designer drew rather
+/// than a shape this renderer invented: the same rectangles <see cref="Beads"/> was
+/// measured from, kept rather than discarded.
+/// </param>
+/// <param name="Sound">What it sounds like when it knocks.</param>
+/// <param name="DrawRegion">
+/// What is rasterised when the body is drawn: the body with a margin round it, so the soft
+/// edge of an ear or a spike the measurement left outside the body is drawn rather than
+/// cut off flat. The body still sets the charm's size and where it hangs. Null draws
+/// exactly the body.
+/// </param>
+/// <param name="HangsByOwnCord">The rope drawn in its own artwork is the rope it hangs by.</param>
+/// <param name="CordInset">
+/// Where the drawn cord ends, when that is lower than the charm can be hung from — the
+/// cord then carries on behind the artwork to it. Null for every charm whose cord ends at
+/// its knot.
+/// </param>
+public sealed record CharmDescriptor(
+    string Id,
+    string DisplayName,
+    string FileName,
+    CharmMetrics Metrics,
+    CharmPalette Palette,
+    IReadOnlyList<CharmBead> Beads,
+    Rect Body,
+    IReadOnlyList<Rect> BeadRegions,
+    Hangly.Core.Audio.CharmSound Sound = Hangly.Core.Audio.CharmSound.Soft,
+    double? CordInset = null,
+    Rect? DrawRegion = null,
+    bool HangsByOwnCord = false);
+
+/// <summary>Where one charm is drawn: its centre, its radius and how far it is turned.</summary>
+/// <param name="Rotation">From hanging straight down, in radians.</param>
+public readonly record struct CharmHang(Vec2 Center, double Radius, double Rotation);
+
+/// <summary>Rasterises charm artwork, once per size.</summary>
+/// <remarks>
+/// The artwork is SVG on both platforms, and both builds rasterise it at the exact size
+/// each frame needs rather than shipping baked bitmaps. The macOS original measured what
+/// the alternative costs: an asset catalog bakes a bitmap of every vector at each scale
+/// factor beside the vector data, and those bitmaps came to fifty-six megabytes against
+/// eighteen of vectors, none of which were ever drawn.
+///
+/// <para>The cache is keyed on the charm and the rounded pixel size, so a charm that is
+/// growing as it fades in rasterises once per whole pixel it passes through rather than
+/// once per frame, and a settled rope rasterises nothing at all. That size is in device
+/// pixels, which is also what keys one display's rasters apart from another's.</para>
+///
+/// <para>The same folder of SVGs the macOS bundle carries is copied into the output
+/// directory by the project file. Neither build has its own copy of the artwork.</para>
+/// </remarks>
+public sealed class CharmArtworkCache : IDisposable
+{
+    private readonly string directory;
+    private readonly Dictionary<string, SKSvg> documents = [];
+    private readonly Dictionary<string, SKImage?> naturals = [];
+    private readonly Dictionary<(string File, int Level), SKImage?> levels = [];
+    private readonly Dictionary<(string File, int Size, Rect Region), CanvasBitmap> rasters = [];
+    private readonly Dictionary<(string File, int Size, Rect Region), long> lastDrawn = [];
+    private readonly Dictionary<(string File, int Beads, int Body, bool CordDrawn), CharmArtworkRegions?> regions = [];
+    private readonly ICanvasResourceCreator resourceCreator;
+
+    /// <summary>Guards <see cref="documents"/> and <see cref="regions"/>.</summary>
+    /// <remarks>
+    /// The one part of this cache two threads reach: the UI thread measures a charm when
+    /// the rope's charms change, while the overlay's own frame loop is drawing from the
+    /// same documents. Everything else — the rasters and the reductions — is touched only
+    /// by the frame loop.
+    /// </remarks>
+    private readonly object gate = new();
+
+    /// <summary>How many frames this cache has drawn, for <see cref="EndFrame"/>.</summary>
+    private long frame;
+
+    public CharmArtworkCache(ICanvasResourceCreator resourceCreator, string directory)
+    {
+        this.resourceCreator = resourceCreator;
+        this.directory = directory;
+    }
+
+    /// <summary>The bundled folder of charm artwork, copied in whole from Assets/Charms.</summary>
+    public static string DefaultDirectory => Path.Combine(AppContext.BaseDirectory, "Assets", "Charms");
+
+    public void Draw(CanvasDrawingSession session, CharmDescriptor? charm, CharmPlacement placement) =>
+        Draw(session, charm, new CharmHang(placement.Center, placement.Radius, placement.Angle - (Math.PI / 2)));
+
+    /// <summary>Draws a charm's body where <paramref name="hang"/> puts it.</summary>
+    /// <remarks>
+    /// Rasterised in <em>device</em> pixels, not in the points the session is measured in:
+    /// a bitmap sized in points is stretched by the DPI factor on its way to the screen, and
+    /// at 200% every source pixel was drawn to four. The charm hangs the way the cord meets
+    /// it, so it is turned about its centre by the hang's rotation.
+    /// </remarks>
+    public void Draw(CanvasDrawingSession session, CharmDescriptor? charm, CharmHang hang)
+    {
+        if (Place(session, charm, hang, mask: false) is not { Bitmap: { } bitmap } placed)
+        {
+            return;
+        }
+
+        Windows.Foundation.Rect destination = placed.Destination;
+
+        System.Numerics.Matrix3x2 previous = session.Transform;
+        session.Transform = Turn(hang) * previous;
+        DrawShadow(session, bitmap, destination, hang.Radius);
+
+        // Cubic rather than the default linear, because the rotation resamples every
+        // charm that is not hanging dead straight and linear is where the rim of the
+        // shield picked up its stair-stepping.
+        session.DrawImage(
+            bitmap,
+            destination,
+            new Windows.Foundation.Rect(0, 0, bitmap.SizeInPixels.Width, bitmap.SizeInPixels.Height),
+            1f,
+            Microsoft.Graphics.Canvas.CanvasImageInterpolation.HighQualityCubic);
+        session.Transform = previous;
+    }
+
+    /// <summary>Takes the rope out from behind a charm.</summary>
+    /// <remarks>
+    /// The charm's silhouette, its alpha raised four-fold so anything a quarter opaque or
+    /// more counts as solid, drawn with <c>DestinationOut</c> onto the layer the rope is in,
+    /// at exactly the place and size the charm is drawn: no rope pixel survives under the
+    /// charm, its soft edge or a faint halo, and the rope is seen only where the artwork is
+    /// open — inside a hook. macOS's <c>CharmRenderer.eraseBehind</c>.
+    /// </remarks>
+    public void EraseBehind(CanvasDrawingSession layer, CharmDescriptor? charm, CharmHang hang)
+    {
+        if (Place(layer, charm, hang, mask: true) is not { Bitmap: { } mask } placed)
+        {
+            return;
+        }
+
+        Windows.Foundation.Rect destination = placed.Destination;
+
+        System.Numerics.Matrix3x2 previous = layer.Transform;
+        layer.Transform = Turn(hang) * previous;
+        layer.DrawImage(
+            mask,
+            destination,
+            new Windows.Foundation.Rect(0, 0, mask.SizeInPixels.Width, mask.SizeInPixels.Height),
+            1f,
+            Microsoft.Graphics.Canvas.CanvasImageInterpolation.HighQualityCubic,
+            Microsoft.Graphics.Canvas.CanvasComposite.DestinationOut);
+        layer.Transform = previous;
+    }
+
+    private static System.Numerics.Matrix3x2 Turn(CharmHang hang) =>
+        System.Numerics.Matrix3x2.CreateRotation(
+            (float)hang.Rotation,
+            new System.Numerics.Vector2((float)hang.Center.X, (float)hang.Center.Y));
+
+    /// <summary>The body's raster, or its mask, and where it lands before turning.</summary>
+    /// <remarks>
+    /// The body — the measured charm — is what the hang describes: centred on the hang's
+    /// centre, its longest side spanning the charm. The draw region extends past it by a
+    /// margin at the same scale, so the charm keeps its size and place and only gains its
+    /// soft edge. The destination is derived back from the raster's whole pixels, so the
+    /// bitmap lands on device pixels one for one and the rotation is the only resample.
+    /// </remarks>
+    private (CanvasBitmap? Bitmap, Windows.Foundation.Rect Destination)? Place(
+        CanvasDrawingSession session, CharmDescriptor? charm, CharmHang hang, bool mask)
+    {
+        if (charm is null || hang.Radius <= 0)
+        {
+            return null;
+        }
+
+        Rect frame = charm.Body;
+        Rect region = charm.DrawRegion ?? frame;
+        double longest = Math.Max(frame.Width, frame.Height);
+        if (longest <= 0 || region.Width <= 0 || region.Height <= 0)
+        {
+            return null;
+        }
+
+        double density = session.Dpi / 96.0;
+        double unit = hang.Radius * 2 * density / longest;
+        CanvasBitmap? bitmap = RasterRegion(charm.FileName, unit, region, mask);
+        if (bitmap is null)
+        {
+            return null;
+        }
+
+        double points = unit / density;
+        var destination = new Windows.Foundation.Rect(
+            hang.Center.X + ((region.Left - (frame.Left + (frame.Width / 2))) * points),
+            hang.Center.Y + ((region.Top - (frame.Top + (frame.Height / 2))) * points),
+            bitmap.SizeInPixels.Width / density,
+            bitmap.SizeInPixels.Height / density);
+        return (bitmap, destination);
+    }
+
+    /// <summary>Draws one bead, as the artwork drew it.</summary>
+    /// <remarks>
+    /// The bead is a region of the charm's own SVG, rasterised on its own at the size it
+    /// appears — the same call the body goes through, with a different rectangle. It is
+    /// not a shape this renderer composes, and deliberately so: a charm's beads carry the
+    /// designer's material, and three beads drawn touching are one measured run, so any
+    /// attempt to synthesise them draws one blob where the picture has three.
+    ///
+    /// <para>Rotated with the cord like the charm is, because a bead threaded on a cord
+    /// turns with it.</para>
+    /// </remarks>
+    public void DrawBead(
+        CanvasDrawingSession session,
+        CharmDescriptor charm,
+        BeadPlacement placement,
+        Rect region)
+    {
+        double side = Math.Max(placement.Size.Width, placement.Size.Height);
+        if (side <= 0 || region.Width <= 0 || region.Height <= 0)
+        {
+            return;
+        }
+
+        int pixels = (int)Math.Round(side * (session.Dpi / 96.0));
+        if (pixels <= 0)
+        {
+            return;
+        }
+
+        CanvasBitmap? bitmap = Raster(charm.FileName, pixels, region);
+        if (bitmap is null)
+        {
+            return;
+        }
+
+        System.Numerics.Matrix3x2 previous = session.Transform;
+        var center = new System.Numerics.Vector2(
+            (float)placement.Position.X,
+            (float)placement.Position.Y);
+
+        session.Transform =
+            System.Numerics.Matrix3x2.CreateRotation((float)(placement.Angle - (Math.PI / 2)), center)
+            * previous;
+
+        session.DrawImage(
+            bitmap,
+            new Windows.Foundation.Rect(
+                placement.Position.X - (side / 2),
+                placement.Position.Y - (side / 2),
+                side,
+                side));
+
+        session.Transform = previous;
+    }
+
+    /// <summary>The charm's drop shadow, cast from the artwork's own alpha.</summary>
+    /// <remarks>
+    /// <b>Where these numbers come from.</b> They are measured off the shipping macOS
+    /// 2.0.0 app, not guessed: the overlay was captured over a white backdrop and the
+    /// luminance profile read outward from the charm's silhouette in three directions.
+    /// Against a 112-point charm the background darkened by 21.6% just below the bottom
+    /// edge, 11.0% just above the top edge, and reached white again about 16 points out
+    /// on every side.
+    ///
+    /// <para>A blurred silhouette offset downward fits that exactly. At the bottom edge
+    /// the sample sits <c>offset</c> inside the shadow and at the top edge the same
+    /// distance outside it, so the two readings sum to the opacity — 32.6% — and their
+    /// ratio gives the offset in units of the blur. Solving leaves a standard deviation
+    /// of 0.098 of the charm's radius and an offset of 0.041 of it.</para>
+    ///
+    /// <para><b>What this replaces.</b> A filled ellipse of 1.7 radii at 6% alpha, which
+    /// had no counterpart in the original at all. It was a hard-edged disc and read as
+    /// one — the visible circle in every screenshot of the Windows build.</para>
+    ///
+    /// <para>Cast from the bitmap rather than from a circle, so a charm that is not round
+    /// — a hamsa, a horseshoe — throws its own shape. That is the same guarantee macOS
+    /// documents for imported bitmaps: "a cut-out subject casts the shape of itself and
+    /// not of its bounding box".</para>
+    /// </remarks>
+    private static void DrawShadow(
+        CanvasDrawingSession session,
+        CanvasBitmap bitmap,
+        Windows.Foundation.Rect destination,
+        double radius)
+    {
+        // The effect graph works in the bitmap's own pixels, and the bitmap is rasterised
+        // at the display's resolution while the session is in points — so the blur is
+        // stated in bitmap pixels and the whole result is scaled into place afterwards.
+        // Blurring after the scale would soften by the DPI factor on a 200% display.
+        float scale = (float)(destination.Width / bitmap.SizeInPixels.Width);
+        if (scale <= 0)
+        {
+            return;
+        }
+
+        using var shadow = new Microsoft.Graphics.Canvas.Effects.ShadowEffect
+        {
+            Source = bitmap,
+            BlurAmount = (float)(radius * ShadowBlurRatio / scale),
+            ShadowColor = Windows.UI.Color.FromArgb((byte)Math.Round(255 * ShadowOpacity), 0, 0, 0),
+        };
+
+        using var placed = new Microsoft.Graphics.Canvas.Effects.Transform2DEffect
+        {
+            Source = shadow,
+            TransformMatrix =
+                System.Numerics.Matrix3x2.CreateScale(scale)
+                * System.Numerics.Matrix3x2.CreateTranslation(
+                    (float)destination.X,
+                    (float)(destination.Y + (radius * ShadowOffsetRatio))),
+        };
+
+        session.DrawImage(placed);
+    }
+
+    /// <summary>Blur standard deviation, as a fraction of the charm's radius.</summary>
+    private const double ShadowBlurRatio = 0.098;
+
+    /// <summary>How far the shadow sits below the charm, as a fraction of its radius.</summary>
+    private const double ShadowOffsetRatio = 0.041;
+
+    /// <summary>Peak darkening under the charm.</summary>
+    /// <remarks>
+    /// Raised from 0.326 after reading the two builds side by side: macOS is darker where
+    /// the shadow meets the artwork and carries further before it reaches the ground.
+    /// </remarks>
+    private const double ShadowOpacity = 0.38;
+
+    /// <summary>
+    /// Measures how a charm's artwork divides into beads and body, once per charm.
+    /// </summary>
+    /// <remarks>
+    /// The analysis raster is its own size and its own pass: it is read for its alpha
+    /// channel only, and never drawn. <see langword="null"/> when the artwork is missing
+    /// or does not have the parts the catalogue claims, which the caller reports rather
+    /// than papering over.
+    /// </remarks>
+    public CharmArtworkRegions? Measure(CharmCatalogEntry entry)
+    {
+        var key = (entry.FileName, entry.BeadCount, entry.BodyRun, entry.CordDrawn);
+        lock (gate)
+        {
+            if (regions.TryGetValue(key, out CharmArtworkRegions? cached))
+            {
+                return cached;
+            }
+
+            CharmArtworkRegions? measured = MeasureDocument(Document(entry.FileName), entry);
+            regions[key] = measured;
+            return measured;
+        }
+    }
+
+    /// <summary>The measurement itself, with no cache and no device behind it.</summary>
+    private static CharmArtworkRegions? MeasureDocument(SKSvg? document, CharmCatalogEntry entry)
+    {
+        if (document?.Picture is null)
+        {
+            return null;
+        }
+
+        SKRect bounds = document.Picture.CullRect;
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            return null;
+        }
+
+        int side = CharmArtworkSplitter.AnalysisPixels;
+        float scale = Math.Min(side / bounds.Width, side / bounds.Height);
+
+        // How much of the fitted square the drawing actually occupies. The cord threshold
+        // is a fraction of what was drawn, not of the margin around it.
+        double contentWidth = bounds.Width * scale / side;
+
+        byte[]? alpha = AlphaMask(document, bounds, scale, side);
+        return alpha is null
+            ? null
+            : CharmArtworkSplitter.Split(alpha, side, contentWidth, entry.BeadCount, entry.BodyRun, entry.CordDrawn);
+    }
+
+    /// <summary>What happened when every charm in the catalogue was opened and measured.</summary>
+    public readonly record struct ArtworkReport(
+        IReadOnlyList<string> Missing,
+        IReadOnlyList<string> Unmeasured,
+        int Measured);
+
+    /// <summary>
+    /// Opens and measures every charm in the catalogue, and says which ones failed.
+    /// </summary>
+    /// <remarks>
+    /// The port of the macOS build's development-only launch check, and deliberately not
+    /// something the app does on the way up: this opens eighty-one SVGs and rasterises
+    /// each one, which is a second of work a user never asked for. A shipped Hangly
+    /// measures a charm when it hangs it and not before.
+    ///
+    /// <para>Needs no graphics device, because measuring is Skia and arithmetic. That is
+    /// what lets it run from a command-line switch on a machine with no window open.</para>
+    /// </remarks>
+    public static ArtworkReport CheckAll(string directory)
+    {
+        var missing = new List<string>();
+        var unmeasured = new List<string>();
+        int measured = 0;
+
+        foreach (CharmCatalogEntry entry in CharmCatalog.All)
+        {
+            string path = Path.Combine(directory, entry.FileName);
+            if (!File.Exists(path))
+            {
+                missing.Add($"{entry.Id} ({entry.FileName})");
+                continue;
+            }
+
+            using var document = new SKSvg();
+            try
+            {
+                document.Load(path);
+            }
+            catch (Exception exception)
+            {
+                missing.Add($"{entry.Id} ({entry.FileName}): {exception.GetType().Name}");
+                continue;
+            }
+
+            if (MeasureDocument(document, entry) is null)
+            {
+                unmeasured.Add($"{entry.Id} (beads {entry.BeadCount}, body {entry.BodyRun})");
+            }
+            else
+            {
+                measured++;
+            }
+        }
+
+        return new ArtworkReport(missing, unmeasured, measured);
+    }
+
+    /// <summary>One byte of alpha per pixel of the fitted square, top row first.</summary>
+    private static byte[]? AlphaMask(SKSvg document, SKRect bounds, float scale, int side)
+    {
+        using var surface = SKSurface.Create(new SKImageInfo(
+            side,
+            side,
+            SKColorType.Bgra8888,
+            SKAlphaType.Premul));
+
+        SKCanvas canvas = surface.Canvas;
+        canvas.Clear(SKColors.Transparent);
+        canvas.Translate((side - (bounds.Width * scale)) / 2, (side - (bounds.Height * scale)) / 2);
+        canvas.Scale(scale);
+        canvas.DrawPicture(document.Picture);
+        canvas.Flush();
+
+        using SKImage image = surface.Snapshot();
+        using SKPixmap pixmap = image.PeekPixels();
+        if (pixmap is null)
+        {
+            return null;
+        }
+
+        byte[] pixels = new byte[pixmap.BytesSize];
+        System.Runtime.InteropServices.Marshal.Copy(pixmap.GetPixels(), pixels, 0, pixels.Length);
+
+        var alpha = new byte[side * side];
+        for (int index = 0; index < alpha.Length; index++)
+        {
+            // BGRA: alpha is the fourth byte of each pixel.
+            alpha[index] = pixels[(index * 4) + 3];
+        }
+
+        return alpha;
+    }
+
+    private CanvasBitmap? Raster(string fileName, int pixels, Rect region)
+    {
+        if (rasters.TryGetValue((fileName, pixels, region), out CanvasBitmap? cached))
+        {
+            lastDrawn[(fileName, pixels, region)] = frame;
+            return cached;
+        }
+
+        SKSvg? document = Document(fileName);
+        if (document?.Picture is null)
+        {
+            return null;
+        }
+
+        SKRect bounds = document.Picture.CullRect;
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            return null;
+        }
+
+        // Rasterised once, straight to the size wanted.
+        //
+        // Supersampling was tried here — twice the size, filtered down with a Mitchell
+        // cubic — on the theory that Skia under-filters the high-resolution rasters most
+        // of this artwork is built from. It was measured against a Lanczos reference at
+        // the same size and it was worse, not better: mean gradient across the shield
+        // fell from 36.6 to 23.6 against a reference of 42.1, because two resampling
+        // stages and a deliberately soft cubic lose more than Skia's single stage does.
+        // The direct raster keeps 87% of the reference's detail. Left as it is.
+        using var surface = SKSurface.Create(new SKImageInfo(
+            pixels,
+            pixels,
+            SKColorType.Bgra8888,
+            SKAlphaType.Premul));
+
+        // Only `region` of the artwork is wanted, fitted to the square the charm's radius
+        // describes and keeping its aspect. The region is stated in the fitted unit
+        // square, so the whole square is drawn at whatever size makes the region come out
+        // at `pixels`, and then shifted so the region lands in the middle of the output.
+        //
+        // With a region of the whole square this is exactly the old arithmetic, which is
+        // the point: a charm whose artwork could not be measured still draws.
+        double longest = Math.Max(region.Width, region.Height);
+        if (longest <= 0)
+        {
+            return null;
+        }
+
+        var square = (float)(pixels / longest);
+        float scale = Math.Min(square / bounds.Width, square / bounds.Height);
+        SKCanvas canvas = surface.Canvas;
+        canvas.Clear(SKColors.Transparent);
+
+        // Centre the region in the output box, then bring the region's own origin to it.
+        canvas.Translate(
+            (float)((pixels - (region.Width * square)) / 2) - (float)(region.Left * square),
+            (float)((pixels - (region.Height * square)) / 2) - (float)(region.Top * square));
+        canvas.Translate(
+            (square - (bounds.Width * scale)) / 2,
+            (square - (bounds.Height * scale)) / 2);
+        canvas.Scale(scale);
+        DrawSource(canvas, fileName, document.Picture, bounds, scale);
+        canvas.Flush();
+
+        using SKImage image = surface.Snapshot();
+        using SKPixmap pixmap = image.PeekPixels();
+        if (pixmap is null)
+        {
+            return null;
+        }
+
+        byte[] pixelBytes = new byte[pixmap.BytesSize];
+        System.Runtime.InteropServices.Marshal.Copy(pixmap.GetPixels(), pixelBytes, 0, pixelBytes.Length);
+
+        var bitmap = CanvasBitmap.CreateFromBytes(
+            resourceCreator,
+            pixelBytes,
+            pixels,
+            pixels,
+            Windows.Graphics.DirectX.DirectXPixelFormat.B8G8R8A8UIntNormalized);
+
+        rasters[(fileName, pixels, region)] = bitmap;
+        lastDrawn[(fileName, pixels, region)] = frame;
+        return bitmap;
+    }
+
+    /// <summary>
+    /// Exactly <paramref name="region"/> of the artwork, at <paramref name="unit"/> device
+    /// pixels to the fitted unit square — or its rope mask: the alpha raised four-fold, in
+    /// black.
+    /// </summary>
+    private CanvasBitmap? RasterRegion(string fileName, double unit, Rect region, bool mask)
+    {
+        int width = Math.Max(1, (int)Math.Ceiling(region.Width * unit));
+        int height = Math.Max(1, (int)Math.Ceiling(region.Height * unit));
+        var key = (fileName + (mask ? "\u0000mask" : "\u0000body"), width, region);
+        if (rasters.TryGetValue(key, out CanvasBitmap? cached))
+        {
+            lastDrawn[key] = frame;
+            return cached;
+        }
+
+        SKSvg? document = Document(fileName);
+        if (document?.Picture is null)
+        {
+            return null;
+        }
+
+        SKRect bounds = document.Picture.CullRect;
+        if (bounds.Width <= 0 || bounds.Height <= 0)
+        {
+            return null;
+        }
+
+        using var surface = SKSurface.Create(new SKImageInfo(width, height, SKColorType.Bgra8888, SKAlphaType.Premul));
+        SKCanvas canvas = surface.Canvas;
+        canvas.Clear(SKColors.Transparent);
+
+        // The region's origin to the bitmap's, then the artwork fitted in the unit square
+        // and centred in it, as every other raster here places it.
+        float scale = (float)Math.Min(unit / bounds.Width, unit / bounds.Height);
+        canvas.Translate(-(float)(region.Left * unit), -(float)(region.Top * unit));
+        canvas.Translate((float)((unit - (bounds.Width * scale)) / 2), (float)((unit - (bounds.Height * scale)) / 2));
+        canvas.Scale(scale);
+        DrawSource(canvas, fileName, document.Picture, bounds, scale);
+        canvas.Flush();
+
+        using SKImage image = surface.Snapshot();
+        using SKPixmap pixmap = image.PeekPixels();
+        if (pixmap is null)
+        {
+            return null;
+        }
+
+        byte[] pixelBytes = new byte[pixmap.BytesSize];
+        System.Runtime.InteropServices.Marshal.Copy(pixmap.GetPixels(), pixelBytes, 0, pixelBytes.Length);
+        if (mask)
+        {
+            for (int index = 0; index < pixelBytes.Length; index += 4)
+            {
+                int raised = Math.Min(255, pixelBytes[index + 3] * 4);
+                pixelBytes[index] = 0;
+                pixelBytes[index + 1] = 0;
+                pixelBytes[index + 2] = 0;
+                pixelBytes[index + 3] = (byte)raised;
+            }
+        }
+
+        var bitmap = CanvasBitmap.CreateFromBytes(
+            resourceCreator,
+            pixelBytes,
+            width,
+            height,
+            Windows.Graphics.DirectX.DirectXPixelFormat.B8G8R8A8UIntNormalized);
+
+        rasters[key] = bitmap;
+        lastDrawn[key] = frame;
+        return bitmap;
+    }
+
+    /// <summary>How many drawn frames a raster may go unused before it is let go.</summary>
+    private const long StaleAfterFrames = 2;
+
+    /// <summary>Lets go of every raster the last few drawn frames did not use.</summary>
+    /// <remarks>
+    /// Called by the renderer once per frame it draws, from the frame loop. The cache is
+    /// keyed on the exact pixel size, and before this it kept every size it had ever made:
+    /// a charm fading in grows through every whole pixel from nothing to its full size, and
+    /// at 200% that left some two hundred bitmaps behind — the sum of their squares, about
+    /// fourteen megabytes, for one charm arriving once. A display change did the same with
+    /// the old display's sizes.
+    ///
+    /// <para>A rope that is swinging or being dragged draws the same sizes every frame, so
+    /// it never loses a raster it is about to draw; only sizes that have been passed
+    /// through go. A settled rope draws nothing and so calls nothing, which is why this
+    /// counts drawn frames rather than time.</para>
+    /// </remarks>
+    public void EndFrame()
+    {
+        frame++;
+        if (rasters.Count == 0)
+        {
+            return;
+        }
+
+        List<(string File, int Size, Rect Region)>? stale = null;
+        foreach (KeyValuePair<(string File, int Size, Rect Region), long> entry in lastDrawn)
+        {
+            if (frame - entry.Value > StaleAfterFrames)
+            {
+                (stale ??= []).Add(entry.Key);
+            }
+        }
+
+        if (stale is null)
+        {
+            return;
+        }
+
+        foreach ((string File, int Size, Rect Region) key in stale)
+        {
+            if (rasters.Remove(key, out CanvasBitmap? bitmap))
+            {
+                bitmap.Dispose();
+            }
+
+            lastDrawn.Remove(key);
+        }
+    }
+
+    /// <summary>How many rasters are held, for the tests and the memory audit.</summary>
+    public int RasterCount => rasters.Count;
+
+    /// <summary>Forgets everything drawn from artwork that is no longer on the rope.</summary>
+    /// <remarks>
+    /// Called from the frame loop when the rope is given new charms. A charm taken off the
+    /// rope used to keep its parsed document, its full-size render and its reduction chain
+    /// for the rest of the run — a megabyte or two each, for every charm ever tried on.
+    /// The measured regions are kept: they are a few rectangles, and the Library asks for
+    /// them again whenever it describes the charm.
+    /// </remarks>
+    public void Retain(IEnumerable<string> fileNames)
+    {
+        var keep = new HashSet<string>(fileNames, StringComparer.Ordinal);
+
+        foreach (string file in naturals.Keys.Where(file => !keep.Contains(file)).ToList())
+        {
+            naturals[file]?.Dispose();
+            naturals.Remove(file);
+        }
+
+        foreach ((string File, int Level) key in levels.Keys.Where(key => !keep.Contains(key.File)).ToList())
+        {
+            levels[key]?.Dispose();
+            levels.Remove(key);
+        }
+
+        foreach ((string File, int Size, Rect Region) key in rasters.Keys.Where(key => !keep.Contains(key.File)).ToList())
+        {
+            rasters[key].Dispose();
+            rasters.Remove(key);
+            lastDrawn.Remove(key);
+        }
+
+        lock (gate)
+        {
+            foreach (string file in documents.Keys.Where(file => !keep.Contains(file)).ToList())
+            {
+                documents[file].Dispose();
+                documents.Remove(file);
+            }
+        }
+    }
+
+    /// <summary>Draws the artwork into <paramref name="canvas"/> at whatever scale is set.</summary>
+    /// <remarks>
+    /// <b>Why this is not just DrawPicture.</b> Every charm in the bundle is an SVG
+    /// wrapping one embedded PNG — Captain America is a 492x556 raster inside a 492x556
+    /// viewBox — so replaying the picture into a small surface is a bitmap downscale, and
+    /// Skia performs it with the sampling the picture recorded, which is a single
+    /// unfiltered stage. That is what the parity measurement found: Windows kept 87% of a
+    /// Lanczos reference's mean gradient but with *higher* peaks than the reference, the
+    /// signature of under-filtered sampling rather than blur. On screen it reads as the
+    /// rim of the shield breaking up into noise.
+    ///
+    /// <para><b>Why this is not the supersampling that was already tried.</b> That
+    /// rasterised at twice the *target* size and filtered down with a Mitchell cubic, and
+    /// measured worse — twice a small target is still far below the source, so the first
+    /// stage had already thrown the detail away before the second stage ran. This renders
+    /// at the source's own size, where there is nothing to lose because an embedded image
+    /// maps one to one, and then performs exactly one filtered downscale from it.</para>
+    ///
+    /// <para>Only when shrinking. A charm drawn larger than its source is the one case
+    /// where the picture has something a bitmap does not — a genuine vector path stays
+    /// sharp at any size — so that path replays the picture as before.</para>
+    /// </remarks>
+    private void DrawSource(SKCanvas canvas, string fileName, SKPicture picture, SKRect bounds, float scale)
+    {
+        if (scale >= 1)
+        {
+            canvas.DrawPicture(picture);
+            return;
+        }
+
+        SKImage? source = Reduced(fileName, picture, bounds, scale);
+        if (source is null)
+        {
+            canvas.DrawPicture(picture);
+            return;
+        }
+
+        canvas.DrawImage(source, bounds, Downscale);
+    }
+
+    /// <summary>The artwork halved until it is within one step of the size asked for.</summary>
+    /// <remarks>
+    /// <b>Why halving and not a better filter.</b> A resampler is a reconstruction filter:
+    /// it reads a fixed neighbourhood around each destination sample — four pixels across
+    /// for any of the cubics — and it does not widen that neighbourhood as the scale
+    /// factor grows. Drawing a 492-pixel source into a 110-pixel box therefore reads about
+    /// four source pixels out of every twenty and never looks at the rest, whatever the
+    /// filter is called. The pixels it skips are the detail, and what it returns instead
+    /// is noise: the grain on the rim of the shield.
+    ///
+    /// <para>Halving is the fix because a 2:1 step with a linear filter reads all four
+    /// pixels that fall in each output pixel and averages them — a box filter, exactly the
+    /// decimation the ratio calls for. Repeated, it carries every source pixel down into
+    /// the result. What reaches <see cref="Downscale"/> is then never more than a factor of
+    /// two away, which is the range a reconstruction filter is actually good at.</para>
+    ///
+    /// <para>Cached per file per level, so the chain is built once and the steady state
+    /// rasterises nothing. Each level is a quarter of the one above it, so the whole chain
+    /// costs a third more than the full-size image alone.</para>
+    /// </remarks>
+    private SKImage? Reduced(string fileName, SKPicture picture, SKRect bounds, float scale)
+    {
+        SKImage? source = Natural(fileName, picture, bounds);
+        if (source is null)
+        {
+            return null;
+        }
+
+        // How many times the artwork can be halved before it would pass the size wanted.
+        double wanted = Math.Max(bounds.Width * scale, 1);
+        int level = 0;
+        for (double side = source.Width; side / 2 >= wanted && level < MaxReductions; level++)
+        {
+            side /= 2;
+        }
+
+        for (int step = 1; step <= level; step++)
+        {
+            if (levels.TryGetValue((fileName, step), out SKImage? existing))
+            {
+                source = existing ?? source;
+                continue;
+            }
+
+            SKImage? halved = Halve(source);
+            levels[(fileName, step)] = halved;
+            if (halved is null)
+            {
+                break;
+            }
+
+            source = halved;
+        }
+
+        return source;
+    }
+
+    /// <summary>One 2:1 reduction, which a linear filter performs as a box average.</summary>
+    private static SKImage? Halve(SKImage source)
+    {
+        int width = Math.Max(source.Width / 2, 1);
+        int height = Math.Max(source.Height / 2, 1);
+
+        using var surface = SKSurface.Create(new SKImageInfo(
+            width,
+            height,
+            SKColorType.Bgra8888,
+            SKAlphaType.Premul));
+
+        if (surface is null)
+        {
+            return null;
+        }
+
+        surface.Canvas.Clear(SKColors.Transparent);
+        surface.Canvas.DrawImage(
+            source,
+            new SKRect(0, 0, width, height),
+            new SKSamplingOptions(SKFilterMode.Linear, SKMipmapMode.None));
+        surface.Canvas.Flush();
+        return surface.Snapshot();
+    }
+
+    /// <summary>A floor on the chain, so a degenerate size cannot loop.</summary>
+    private const int MaxReductions = 8;
+
+    /// <summary>The artwork rendered once at its own size, to be filtered down from.</summary>
+    /// <remarks>
+    /// Cached per file and never per size: it is the thing every size is derived from.
+    /// One 492x556 BGRA image is under a megabyte, and there are three on the cord at
+    /// most.
+    /// </remarks>
+    private SKImage? Natural(string fileName, SKPicture picture, SKRect bounds)
+    {
+        if (naturals.TryGetValue(fileName, out SKImage? cached))
+        {
+            return cached;
+        }
+
+        int width = (int)Math.Ceiling(bounds.Width);
+        int height = (int)Math.Ceiling(bounds.Height);
+        SKImage? rendered = null;
+
+        if (width > 0 && height > 0)
+        {
+            using var surface = SKSurface.Create(new SKImageInfo(
+                width,
+                height,
+                SKColorType.Bgra8888,
+                SKAlphaType.Premul));
+
+            surface.Canvas.Clear(SKColors.Transparent);
+            surface.Canvas.Translate(-bounds.Left, -bounds.Top);
+            surface.Canvas.DrawPicture(picture);
+            surface.Canvas.Flush();
+            rendered = surface.Snapshot();
+        }
+
+        naturals[fileName] = rendered;
+        return rendered;
+    }
+
+    /// <summary>The filter for the last step, which is never more than a factor of two.</summary>
+    /// <remarks>
+    /// Mitchell, the soft cubic. It was the wrong choice for the abandoned supersampling
+    /// because it was being asked to do the whole reduction on its own, where softness is
+    /// lost detail. After the halving chain it is doing a factor of two at most, where
+    /// softness is what keeps an edge from stair-stepping — which is the difference
+    /// between the two builds side by side.
+    /// </remarks>
+    private static readonly SKSamplingOptions Downscale = new(SKCubicResampler.Mitchell);
+
+    private SKSvg? Document(string fileName)
+    {
+        lock (gate)
+        {
+            if (documents.TryGetValue(fileName, out SKSvg? cached))
+            {
+                return cached;
+            }
+
+            string path = Path.Combine(directory, fileName);
+            if (!File.Exists(path))
+            {
+                return null;
+            }
+
+            var svg = new SKSvg();
+            svg.Load(path);
+            documents[fileName] = svg;
+            return svg;
+        }
+    }
+
+    public void Dispose()
+    {
+        foreach (SKImage? image in naturals.Values)
+        {
+            image?.Dispose();
+        }
+
+        naturals.Clear();
+
+        foreach (SKImage? image in levels.Values)
+        {
+            image?.Dispose();
+        }
+
+        levels.Clear();
+
+        foreach (CanvasBitmap bitmap in rasters.Values)
+        {
+            bitmap.Dispose();
+        }
+
+        foreach (SKSvg document in documents.Values)
+        {
+            document.Dispose();
+        }
+
+        rasters.Clear();
+        lastDrawn.Clear();
+        lock (gate)
+        {
+            documents.Clear();
+        }
+    }
+}

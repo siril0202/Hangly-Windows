@@ -1,0 +1,230 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      Windows 10 1809 (17763) is the floor because that is the oldest build the Windows
+      App SDK supports. 22621 is the SDK compiled against, which is how APIs newer than
+      the floor can be called at all — every one of them is guarded at runtime by
+      ApiInformation rather than assumed.
+    -->
+    <TargetFramework>net9.0-windows10.0.22621.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <SupportedOSPlatformVersion>10.0.17763.0</SupportedOSPlatformVersion>
+
+    <RootNamespace>Hangly.App</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!-- Both architectures Windows ships on. ARM64 is a first-class target, not a
+         compatibility mode: an x64 build under emulation would run the 240 Hz solver
+         through a translator on exactly the machines with the least power budget. -->
+    <RuntimeIdentifiers>win-x64;win-arm64</RuntimeIdentifiers>
+    <Platforms>x64;ARM64</Platforms>
+
+    <UseWinUI>true</UseWinUI>
+    <OutputType>WinExe</OutputType>
+
+    <!-- Unpackaged by default: Hangly is a small ornament people download as an .exe,
+         the way the macOS build is a disk image rather than a Mac App Store listing. -->
+    <WindowsPackageType>None</WindowsPackageType>
+
+    <!--
+      Required even though nothing here is packaged, and removing it is what broke the
+      first build that ran on a real machine.
+
+      This switch owns the target that builds the app's own PRI file, and in WinUI the
+      compiled XAML (.xbf) lives *inside* that PRI rather than beside it. Without it the
+      app published with no resource map and no XAML at all: InitializeComponent asked
+      for ms-appx:///App.xaml, found nothing, and Microsoft.UI.Xaml.dll raised a stowed
+      exception (0xc000027b) before any of our code could report it.
+    -->
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>false</PublishSingleFile>
+
+    <!--
+      Velopack needs to run before XAML starts, so the generated entry point is renamed
+      rather than removed and Program.cs calls it. See Program.cs for why the order
+      matters.
+    -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+
+    <ApplicationIcon>Assets/hangly.ico</ApplicationIcon>
+    <AssemblyName>Hangly</AssemblyName>
+
+    <!-- Identity. The About page reads these back rather than restating them, so there
+         is one place they are written and the window cannot disagree with the binary. -->
+    <Product>Hangly</Product>
+    <Company>CodeWithSiril Technologies</Company>
+    <!--
+      One version, set here and overridden by the release build with -p:Version=. The
+      file version is deliberately NOT stated separately: MSBuild derives it from this,
+      so a 0.9.0 package reports 0.9.0 rather than whatever was last typed here. It used
+      to say 2.0.0.0 unconditionally, which made every package's properties disagree with
+      the release it came from.
+
+      0.9.0 rather than the macOS build's 2.0.0: this is the first Windows release, and a
+      development build that claims a version that was never released is a build whose
+      About page cannot be trusted in a bug report.
+    -->
+    <Version>2.1.0</Version>
+    <Copyright>Copyright © 2026 CodeWithSiril Technologies. All rights reserved.</Copyright>
+
+    <!--
+      Google Analytics (the same property as macOS's Firebase Analytics, through its Web
+      stream's Measurement Protocol). Never written here: the release workflow passes them
+      from repository secrets (-p:HanglyGa4MeasurementId=G-... -p:HanglyGa4ApiSecret=...).
+      Empty, as in every developer build, means no analytics and nothing sent.
+    -->
+    <HanglyGa4MeasurementId Condition="'$(HanglyGa4MeasurementId)' == ''"></HanglyGa4MeasurementId>
+    <HanglyGa4ApiSecret Condition="'$(HanglyGa4ApiSecret)' == ''"></HanglyGa4ApiSecret>
+    <HanglyBuildNumber Condition="'$(HanglyBuildNumber)' == ''">6</HanglyBuildNumber>
+    <!--
+      The installation registry's URL. Never written here: the release workflow passes it
+      from the HANGLY_REGISTRY_URL repository secret (-p:HanglyRegistryUrl=...). Empty, as
+      in every developer build, means no registry and nothing sent.
+    -->
+    <HanglyRegistryUrl Condition="'$(HanglyRegistryUrl)' == ''"></HanglyRegistryUrl>
+    <!--
+      A folder of packages to update from instead of GitHub Releases. Empty in every
+      release, which release.yml checks. Set only to test silent updating end to end:
+          dotnet publish ... -p:HanglyUpdateFeed=C:\hangly\feed
+    -->
+    <HanglyUpdateFeed Condition="'$(HanglyUpdateFeed)' == ''"></HanglyUpdateFeed>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+
+    <!--
+      Warnings are errors everywhere in this solution except here. The WinUI XAML compiler
+      generates C# that does not satisfy the analyzers this repository turns on — nullable
+      annotations and unused parameters in particular — and that generated code cannot be
+      edited. Failing the build on it would mean the rule could never be satisfied, so the
+      rule is switched off for this one project rather than suppressed case by case.
+    -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <WarningsAsErrors />
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.5.1" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2705" />
+
+    <!-- Win2D is the port of the original's CoreGraphics drawing: immediate-mode 2D
+         with the same primitives — paths, strokes, dashes, gradients and layers — so
+         the renderer transcribes rather than reinvents. -->
+    <PackageReference Include="Microsoft.Graphics.Win2D" Version="1.4.0" />
+
+    <!-- The updater. Only the runtime half lives here; the vpk CLI that builds releases
+         is a developer tool and is not referenced by the app. -->
+    <PackageReference Include="Velopack" Version="1.2.0" />
+
+    <!-- SVG is the charm artwork's source format on both platforms. Svg.Skia rasterises
+         it at the exact size each frame needs, which is what the macOS VectorImage does
+         and why neither build ships baked bitmaps. -->
+    <!-- For pulling the app icon back out of the executable for the About page. The
+         icon is embedded by ApplicationIcon and deliberately not shipped as Content as
+         well, because one file registered twice is what gives the PRI compiler two
+         entries for one path. -->
+    <PackageReference Include="System.Drawing.Common" Version="9.0.0" />
+
+    <PackageReference Include="Svg.Skia" Version="5.2.3" />
+
+    <!-- Named explicitly rather than left to Svg.Skia's transitive reference, because the
+         native Skia binary has to be restored for both architectures and an implicit
+         reference resolves only the one the build happens to be running on. -->
+    <PackageReference Include="SkiaSharp" Version="4.152.1" />
+    <PackageReference Include="SkiaSharp.NativeAssets.Win32" Version="4.152.1" />
+
+    <!-- Runs Creator Studio's subject model, offline: on the GPU through DirectML where
+         there is one, on the CPU where there is not. The DirectML build carries ONNX
+         Runtime's CPU provider as well, so it is the only runtime package; the two cannot
+         be referenced together, because both ship onnxruntime.dll. The GPU is an
+         accelerator, not a requirement (D1), and the Studio stays usable while the model
+         runs (StudioSession). -->
+    <PackageReference Include="Microsoft.ML.OnnxRuntime.DirectML" Version="1.24.4" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="../Hangly.Core/Hangly.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <AssemblyMetadata Include="HanglyGa4MeasurementId" Value="$(HanglyGa4MeasurementId)" />
+    <AssemblyMetadata Include="HanglyGa4ApiSecret" Value="$(HanglyGa4ApiSecret)" />
+    <AssemblyMetadata Include="HanglyBuildNumber" Value="$(HanglyBuildNumber)" />
+    <AssemblyMetadata Include="HanglyRegistryUrl" Value="$(HanglyRegistryUrl)" />
+    <AssemblyMetadata Include="HanglyUpdateFeed" Value="$(HanglyUpdateFeed)" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Copied whole, exactly as the macOS bundle copies Assets/Charms. -->
+    <Content Include="Assets/Charms/**" CopyToOutputDirectory="PreserveNewest" />
+    <!-- The Spider-Man entrance's sound slot: whatever is there is copied; empty is silent. -->
+    <Content Include="Assets/Sounds/*.wav" CopyToOutputDirectory="PreserveNewest" />
+
+    <!--
+      The creator's UPI code, the same file the macOS bundle ships in Resources.
+
+      None rather than Content, and that distinction is load-bearing. Listing it as
+      Content registers it with the PRI compiler, which already has a claim on this path
+      and answers with the PRI175 / PRI277 duplicate-resource pair — the same failure
+      hangly.ico caused. Nothing here needs it to be a PRI resource: the sheet loads it
+      from AppContext.BaseDirectory as a file, so all it has to do is land beside the
+      executable, which is exactly what None with a copy does.
+    -->
+    <None Include="Assets/CreatorUPIQR.png" CopyToOutputDirectory="PreserveNewest" />
+
+    <!-- hangly.ico is deliberately NOT Content. ApplicationIcon already embeds it in the
+         executable, and registering the same file as a resource as well gives the PRI
+         compiler two entries for one path (PRI175 / PRI277). The tray reads the icon back
+         out of the executable instead, which is also one fewer file to ship and one fewer
+         way for the two copies to drift apart. -->
+  </ItemGroup>
+
+  <!--
+    Creator Studio's subject model: IS-Net (DIS, general use), Apache-2.0, 170 MB. Chosen
+    over BiRefNet for speed at Vision-level accuracy: 4.2 s a picture on a VM's CPU against
+    58 s (PHASE-A-PLAN.md, D1 follow-up). Too large for git, which refuses files over
+    100 MB, so the build fetches it once into .models/ at the repository root and checks
+    it against a pinned SHA-256 before shipping it; a different file fails the build
+    rather than ship. The app itself never downloads anything: the model travels inside
+    the install, and cut-outs work offline from the first launch.
+  -->
+  <PropertyGroup>
+    <SubjectModelUrl>https://github.com/danielgatis/rembg/releases/download/v0.0.0/isnet-general-use.onnx</SubjectModelUrl>
+    <SubjectModelSha256>60920E99C45464F2BA57BEE2AD08C919A52BBF852739E96947FBB4358C0D964A</SubjectModelSha256>
+    <SubjectModelCache>$(MSBuildProjectDirectory)/../../.models/</SubjectModelCache>
+    <SubjectModelFile>$(SubjectModelCache)isnet-general-use.onnx</SubjectModelFile>
+  </PropertyGroup>
+
+  <Target Name="FetchSubjectModel" BeforeTargets="AssignTargetPaths" Condition="!Exists('$(SubjectModelFile)')">
+    <DownloadFile SourceUrl="$(SubjectModelUrl)" DestinationFolder="$(SubjectModelCache)" DestinationFileName="isnet-general-use.onnx.partial" Retries="3" />
+    <GetFileHash Files="$(SubjectModelCache)isnet-general-use.onnx.partial" Algorithm="SHA256">
+      <Output TaskParameter="Hash" PropertyName="FetchedSubjectModelHash" />
+    </GetFileHash>
+    <Delete Files="$(SubjectModelCache)isnet-general-use.onnx.partial" Condition="'$(FetchedSubjectModelHash)' != '$(SubjectModelSha256)'" />
+    <Error Condition="'$(FetchedSubjectModelHash)' != '$(SubjectModelSha256)'" Text="The subject model's SHA-256 is $(FetchedSubjectModelHash), not the pinned $(SubjectModelSha256). Not shipping it." />
+    <Move SourceFiles="$(SubjectModelCache)isnet-general-use.onnx.partial" DestinationFiles="$(SubjectModelFile)" />
+  </Target>
+
+  <ItemGroup>
+    <!-- None, not Content, for the PRI reason given for CreatorUPIQR.png above. -->
+    <None Include="$(SubjectModelFile)" Link="Models/subject.onnx" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!--
+    The DirectML package also carries its debug layer, its symbols and an import library.
+    None of them run in the app — the debug layer is only loaded by developer tooling — and
+    together they are about 15 MB of every download. Removed after publishing, before the
+    release step packs the folder.
+  -->
+  <Target Name="DropDirectMLDeveloperFiles" AfterTargets="Publish">
+    <Delete Files="$(PublishDir)DirectML.Debug.dll;$(PublishDir)DirectML.Debug.pdb;$(PublishDir)DirectML.pdb;$(PublishDir)onnxruntime.lib" />
+  </Target>
+
+  <!-- A build that updates from a local folder must never be one anybody is given. -->
+  <Target Name="RefuseTestUpdateFeed" BeforeTargets="Build"
+          Condition="'$(HanglyUpdateFeed)' != '' and '$(HanglyAllowTestFeed)' != 'true'">
+    <Error Text="HanglyUpdateFeed is set. That is for silent-update tests only; pass -p:HanglyAllowTestFeed=true to confirm this is one." />
+  </Target>
+
+</Project>

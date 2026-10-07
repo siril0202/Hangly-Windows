@@ -1,0 +1,147 @@
+name: Build
+
+# The Windows build is the point of this workflow. The port was written on a Mac, where
+# WinUI cannot be compiled at all, so CI is not a safety net here — it is the first
+# machine that has ever tried to build the app half of this repository.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  DOTNET_CLI_TELEMETRY_OPTOUT: 1
+  DOTNET_NOLOGO: 1
+
+jobs:
+  core:
+    name: Solver and models
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '9.0.x'
+
+      # Hangly.Core has no Windows types in it, so this job proves the same thing the
+      # macOS run proves. It runs on Windows anyway because "the rope behaves identically"
+      # is a claim about floating-point arithmetic, and that is exactly the kind of claim
+      # that deserves to be checked on the platform it will ship on.
+      - name: Test
+        run: dotnet test tests/Hangly.Core.Tests/Hangly.Core.Tests.csproj -c Release --logger "trx;LogFileName=core.trx" --results-directory artifacts/tests
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: test-results
+          path: artifacts/tests
+
+  app:
+    name: App (${{ matrix.rid }})
+    runs-on: windows-latest
+    needs: core
+    strategy:
+      # Both architectures are built even when one fails, because a failure that appears
+      # on only one of them is a different and more interesting bug than one that appears
+      # on both.
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            platform: x64
+          - rid: win-arm64
+            platform: ARM64
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # Creator Studio's model (170 MB) is fetched by the build and checked against the
+      # SHA-256 pinned in Hangly.App.csproj. Cached under that hash, so it is downloaded
+      # once rather than on every run, and a new pin is a new cache.
+      - uses: actions/cache@v6
+        with:
+          path: .models
+          key: subject-model-60920E99C45464F2BA57BEE2AD08C919A52BBF852739E96947FBB4358C0D964A
+
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore
+        run: dotnet restore src/Hangly.App/Hangly.App.csproj -r ${{ matrix.rid }}
+
+      - name: Build
+        run: dotnet build src/Hangly.App/Hangly.App.csproj -c Release -r ${{ matrix.rid }} --no-restore -p:Platform=${{ matrix.platform }}
+
+      - name: Publish
+        run: dotnet publish src/Hangly.App/Hangly.App.csproj -c Release -r ${{ matrix.rid }} -p:Platform=${{ matrix.platform }} -o artifacts/${{ matrix.rid }}
+
+      # A build that compiles can still publish a payload that cannot start: a missing
+      # native Skia binary or a missing WinUI runtime shows up as a silent exit on the
+      # user's machine, not as a build error. CI cannot launch the app — there is no
+      # display — but it can assert that everything the app needs to launch is present.
+      - name: Verify published payload
+        shell: pwsh
+        run: |
+          $root = "artifacts/${{ matrix.rid }}"
+          $required = @(
+            "Hangly.exe",                              # the app itself
+            "Hangly.Core.dll",                         # the solver
+            "Microsoft.ui.xaml.dll",                   # WinUI, self-contained
+            "Microsoft.WindowsAppRuntime.Bootstrap.dll" # unpackaged bootstrap
+          )
+          $missing = @()
+          foreach ($name in $required) {
+            if (-not (Get-ChildItem -Path $root -Filter $name -Recurse -File -ErrorAction SilentlyContinue)) {
+              $missing += $name
+            }
+          }
+
+          # Skia and Win2D are matched loosely because their file names carry an
+          # architecture or a version that differs between the two RIDs.
+          if (-not (Get-ChildItem -Path $root -Filter "*SkiaSharp*.dll" -Recurse -File -ErrorAction SilentlyContinue)) {
+            $missing += "libSkiaSharp (native)"
+          }
+          # Win2D's binary is named for its namespace, not for the product: there is no
+          # file with "Win2D" in it anywhere in the payload.
+          if (-not (Get-ChildItem -Path $root -Filter "Microsoft.Graphics.Canvas*" -Recurse -File -ErrorAction SilentlyContinue)) {
+            $missing += "Win2D (Microsoft.Graphics.Canvas)"
+          }
+
+          # The app's own PRI. WinUI embeds the compiled XAML inside it, so a payload
+          # without one is an app with no XAML: it dies inside Microsoft.UI.Xaml.dll
+          # before any managed code of ours can say so. The four framework PRIs are
+          # always present and are not what this is looking for.
+          $pri = Get-ChildItem -Path $root -Filter "*.pri" -Recurse -File -ErrorAction SilentlyContinue
+          Write-Host "resource indexes found: $($pri.Name -join ', ')"
+          if (-not ($pri | Where-Object { $_.Name -match '^(resources|Hangly)' })) {
+            $missing += "the app's own .pri (no XAML would load)"
+          }
+
+          $svg = (Get-ChildItem -Path $root -Filter "*.svg" -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "charm artwork: $svg SVG files"
+          # Counted from the source, not written down: a number here went stale the
+          # first time an unused SVG was deleted, and failed a build that was correct.
+          $expected = (Get-ChildItem -Path src/Hangly.App/Assets/Charms -Filter "*.svg" -Recurse -File).Count
+          if ($svg -lt $expected) { $missing += "charm artwork (found $svg, expected $expected)" }
+
+          if ($missing.Count -gt 0) {
+            Write-Host "::error::Published payload is incomplete: $($missing -join ', ')"
+
+            # Print what IS there, so the next person debugging this reads an inventory
+            # rather than guessing at a file name the way this check first did.
+            Write-Host "--- payload root ---"
+            Get-ChildItem -Path $root -File | Select-Object -ExpandProperty Name | Sort-Object
+            exit 1
+          }
+          Write-Host "Payload complete for ${{ matrix.rid }}."
+
+      - name: Upload build
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: hangly-${{ matrix.rid }}
+          path: artifacts/${{ matrix.rid }}

@@ -1,0 +1,48 @@
+# Build output
+bin/
+obj/
+publish/
+artifacts/
+
+# Creator Studio's subject model, fetched and hash-checked by the build (Hangly.App.csproj).
+.models/
+
+# IDE
+*.user
+.vs/
+.idea/
+Generated Files/
+
+# Packaging
+*.msix
+*.appx
+*.appxbundle
+
+# macOS. Half of this port is developed on a Mac, and Finder writes one of these
+# into every folder it displays. They were committed once, which broke `git clone`
+# for anyone whose target directory Finder had already touched: git will not
+# overwrite an untracked file with a tracked one, and the checkout aborts.
+.DS_Store
+.AppleDouble
+._*
+
+# Windows
+Thumbs.db
+desktop.ini
+
+# The Spider-Man entrance sound used in development is a temporary stand-in and must
+# not be committed; see src/Hangly.App/Assets/Sounds/README.md.
+src/Hangly.App/Assets/Sounds/SpiderManEntrance.wav
+
+# Firebase configuration is injected by CI from secrets and never committed.
+GoogleService-Info.plist
+google-services.json
+firebase-config*.json
+.firebaserc
+*.mmdb
+
+# Wrangler (Cloudflare CLI) state: account ids, never committed.
+.wrangler/
+
+# Velopack release artifacts
+releases/
