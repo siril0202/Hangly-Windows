@@ -1,4 +1,3 @@
-```yaml
 # Builds, packages and publishes a release.
 #
 # Runs only on a tag, because a release is a deliberate act: pushing to main should never
@@ -184,12 +183,13 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           path: staged
+          pattern: hangly-*
+          merge-multiple: true
 
       # Both architectures land in one release, side by side.
       - name: Publish
         uses: softprops/action-gh-release@v2
         with:
-          files: staged/**/*
+          files: staged/*
           draft: false
           body_path: notes.md
-```
