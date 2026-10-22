@@ -82,7 +82,7 @@ public readonly record struct CharmHang(Vec2 Center, double Radius, double Rotat
 public sealed class CharmArtworkCache : IDisposable
 {
     private readonly string directory;
-    private readonly Dictionary<string, SKSvg> documents = [];
+    private readonly Dictionary<string, LoadedDocument> documents = [];
     private readonly Dictionary<string, SKImage?> naturals = [];
     private readonly Dictionary<(string File, int Level), SKImage?> levels = [];
     private readonly Dictionary<(string File, int Size, Rect Region), CanvasBitmap> rasters = [];
@@ -368,21 +368,21 @@ public sealed class CharmArtworkCache : IDisposable
                 return cached;
             }
 
-            CharmArtworkRegions? measured = MeasureDocument(Document(entry.FileName), entry);
+            CharmArtworkRegions? measured = MeasureDocument(Document(entry.FileName)?.Picture, entry);
             regions[key] = measured;
             return measured;
         }
     }
 
     /// <summary>The measurement itself, with no cache and no device behind it.</summary>
-    private static CharmArtworkRegions? MeasureDocument(SKSvg? document, CharmCatalogEntry entry)
+    private static CharmArtworkRegions? MeasureDocument(SKPicture? picture, CharmCatalogEntry entry)
     {
-        if (document?.Picture is null)
+        if (picture is null)
         {
             return null;
         }
 
-        SKRect bounds = document.Picture.CullRect;
+        SKRect bounds = picture.CullRect;
         if (bounds.Width <= 0 || bounds.Height <= 0)
         {
             return null;
@@ -395,7 +395,7 @@ public sealed class CharmArtworkCache : IDisposable
         // is a fraction of what was drawn, not of the margin around it.
         double contentWidth = bounds.Width * scale / side;
 
-        byte[]? alpha = AlphaMask(document, bounds, scale, side);
+        byte[]? alpha = AlphaMask(picture, bounds, scale, side);
         return alpha is null
             ? null
             : CharmArtworkSplitter.Split(alpha, side, contentWidth, entry.BeadCount, entry.BodyRun, entry.CordDrawn);
@@ -434,18 +434,14 @@ public sealed class CharmArtworkCache : IDisposable
                 continue;
             }
 
-            using var document = new SKSvg();
-            try
+            using LoadedDocument? document = LoadDocument(path);
+            if (document?.Picture is null)
             {
-                document.Load(path);
-            }
-            catch (Exception exception)
-            {
-                missing.Add($"{entry.Id} ({entry.FileName}): {exception.GetType().Name}");
+                missing.Add($"{entry.Id} ({entry.FileName}): could not load");
                 continue;
             }
 
-            if (MeasureDocument(document, entry) is null)
+            if (MeasureDocument(document.Picture, entry) is null)
             {
                 unmeasured.Add($"{entry.Id} (beads {entry.BeadCount}, body {entry.BodyRun})");
             }
@@ -459,7 +455,7 @@ public sealed class CharmArtworkCache : IDisposable
     }
 
     /// <summary>One byte of alpha per pixel of the fitted square, top row first.</summary>
-    private static byte[]? AlphaMask(SKSvg document, SKRect bounds, float scale, int side)
+    private static byte[]? AlphaMask(SKPicture picture, SKRect bounds, float scale, int side)
     {
         using var surface = SKSurface.Create(new SKImageInfo(
             side,
@@ -471,7 +467,7 @@ public sealed class CharmArtworkCache : IDisposable
         canvas.Clear(SKColors.Transparent);
         canvas.Translate((side - (bounds.Width * scale)) / 2, (side - (bounds.Height * scale)) / 2);
         canvas.Scale(scale);
-        canvas.DrawPicture(document.Picture);
+        canvas.DrawPicture(picture);
         canvas.Flush();
 
         using SKImage image = surface.Snapshot();
@@ -502,7 +498,7 @@ public sealed class CharmArtworkCache : IDisposable
             return cached;
         }
 
-        SKSvg? document = Document(fileName);
+        LoadedDocument? document = Document(fileName);
         if (document?.Picture is null)
         {
             return null;
@@ -596,7 +592,7 @@ public sealed class CharmArtworkCache : IDisposable
             return cached;
         }
 
-        SKSvg? document = Document(fileName);
+        LoadedDocument? document = Document(fileName);
         if (document?.Picture is null)
         {
             return null;
@@ -920,11 +916,22 @@ public sealed class CharmArtworkCache : IDisposable
     /// </remarks>
     private static readonly SKSamplingOptions Downscale = new(SKCubicResampler.Mitchell);
 
-    private SKSvg? Document(string fileName)
+    private sealed class LoadedDocument(SKPicture picture, IDisposable? owner = null) : IDisposable
+    {
+        public SKPicture Picture => picture;
+
+        public void Dispose()
+        {
+            picture.Dispose();
+            owner?.Dispose();
+        }
+    }
+
+    private LoadedDocument? Document(string fileName)
     {
         lock (gate)
         {
-            if (documents.TryGetValue(fileName, out SKSvg? cached))
+            if (documents.TryGetValue(fileName, out LoadedDocument? cached))
             {
                 return cached;
             }
@@ -935,10 +942,46 @@ public sealed class CharmArtworkCache : IDisposable
                 return null;
             }
 
-            var svg = new SKSvg();
-            svg.Load(path);
-            documents[fileName] = svg;
-            return svg;
+            LoadedDocument? loaded = LoadDocument(path);
+            if (loaded is not null)
+            {
+                documents[fileName] = loaded;
+            }
+
+            return loaded;
+        }
+    }
+
+    private static LoadedDocument? LoadDocument(string path)
+    {
+        try
+        {
+            if (path.EndsWith(".svg", StringComparison.OrdinalIgnoreCase))
+            {
+                var svg = new SKSvg();
+                svg.Load(path);
+                return svg.Picture is not null ? new LoadedDocument(svg.Picture, svg) : null;
+            }
+
+            using var bitmap = SKBitmap.Decode(path);
+            if (bitmap is null || bitmap.Width <= 0 || bitmap.Height <= 0)
+            {
+                return null;
+            }
+
+            using var image = SKImage.FromBitmap(bitmap);
+            var recorder = new SKPictureRecorder();
+            using (SKCanvas canvas = recorder.BeginRecording(SKRect.Create(0, 0, bitmap.Width, bitmap.Height)))
+            {
+                canvas.DrawImage(image, 0, 0);
+            }
+
+            return new LoadedDocument(recorder.EndRecording());
+        }
+        catch (Exception exception)
+        {
+            Services.Diagnostics.Log($"failed to load artwork from '{path}': {exception.Message}");
+            return null;
         }
     }
 
@@ -963,7 +1006,7 @@ public sealed class CharmArtworkCache : IDisposable
             bitmap.Dispose();
         }
 
-        foreach (SKSvg document in documents.Values)
+        foreach (LoadedDocument document in documents.Values)
         {
             document.Dispose();
         }

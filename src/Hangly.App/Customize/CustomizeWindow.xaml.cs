@@ -498,7 +498,13 @@ public sealed partial class CustomizeWindow : Window
         }
 
         int slash = entry.FileName.LastIndexOf('/');
-        return slash < 0 ? "Classics & Collection" : entry.FileName[..slash];
+        if (slash < 0)
+        {
+            return "Classics & Collection";
+        }
+
+        string pack = entry.FileName[..slash];
+        return string.Equals(pack, "Sinchan", StringComparison.OrdinalIgnoreCase) ? "Shinchan" : pack;
     }
 
     private void BuildRopeChoices() => BrowseMode.SelectedIndex = 0;

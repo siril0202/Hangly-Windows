@@ -22,8 +22,8 @@ public class CharmCatalogTests
     /// removed from macOS too, so the Swift in <c>reference/</c> and this catalogue
     /// agree, and the generator leaves nothing out.
     /// </remarks>
-    [Fact(DisplayName = "A hundred and sixty charms ship, the same as macOS")]
-    public void CountMatchesTheOriginal() => Assert.Equal(160, CharmCatalog.All.Count);
+    [Fact(DisplayName = "A hundred and eighty-six charms ship")]
+    public void CountMatchesTheOriginal() => Assert.Equal(186, CharmCatalog.All.Count);
 
     [Fact(DisplayName = "No charm is filed under a category the chips do not offer")]
     public void EveryCharmHasAnOfferedCategory()
@@ -54,7 +54,10 @@ public class CharmCatalogTests
         {
             Assert.False(string.IsNullOrWhiteSpace(charm.Id));
             Assert.False(string.IsNullOrWhiteSpace(charm.DisplayName));
-            Assert.EndsWith(".svg", charm.FileName, StringComparison.Ordinal);
+            Assert.True(
+                charm.FileName.EndsWith(".svg", StringComparison.Ordinal) ||
+                charm.FileName.EndsWith(".png", StringComparison.Ordinal),
+                $"{charm.Id} has invalid file extension: {charm.FileName}");
         }
     }
 

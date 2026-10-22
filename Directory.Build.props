@@ -5,7 +5,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
     <EnforceCodeStyleInBuild>true</EnforceCodeStyleInBuild>
-    <Authors>CodeWithSiril Technologies</Authors>
+    <Authors>codewithsiril</Authors>
+    <Company>codewithsiril</Company>
     <Product>Hangly</Product>
     <!-- The floor for everything in the solution. The app overrides it, and the release
          build overrides that with the tag. -->

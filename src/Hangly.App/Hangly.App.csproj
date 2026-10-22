@@ -55,7 +55,7 @@
     <!-- Identity. The About page reads these back rather than restating them, so there
          is one place they are written and the window cannot disagree with the binary. -->
     <Product>Hangly</Product>
-    <Company>CodeWithSiril Technologies</Company>
+    <Company>codewithsiril</Company>
     <!--
       One version, set here and overridden by the release build with -p:Version=. The
       file version is deliberately NOT stated separately: MSBuild derives it from this,
@@ -67,7 +67,7 @@
       development build that claims a version that was never released is a build whose
       About page cannot be trusted in a bug report.
     -->
-    <Version>2.1.0</Version>
+    <Version>2.3.0</Version>
     <Copyright>Copyright © 2026 CodeWithSiril Technologies. All rights reserved.</Copyright>
 
     <!--
@@ -78,7 +78,7 @@
     -->
     <HanglyGa4MeasurementId Condition="'$(HanglyGa4MeasurementId)' == ''"></HanglyGa4MeasurementId>
     <HanglyGa4ApiSecret Condition="'$(HanglyGa4ApiSecret)' == ''"></HanglyGa4ApiSecret>
-    <HanglyBuildNumber Condition="'$(HanglyBuildNumber)' == ''">6</HanglyBuildNumber>
+    <HanglyBuildNumber Condition="'$(HanglyBuildNumber)' == ''">7</HanglyBuildNumber>
     <!--
       The installation registry's URL. Never written here: the release workflow passes it
       from the HANGLY_REGISTRY_URL repository secret (-p:HanglyRegistryUrl=...). Empty, as

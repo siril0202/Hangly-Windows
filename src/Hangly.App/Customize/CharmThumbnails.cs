@@ -120,41 +120,77 @@ public static class CharmThumbnails
             return false;
         }
 
-        using var document = new SKSvg();
-        document.Load(source);
-        if (document.Picture is null)
+        (SKPicture? picture, IDisposable? owner) = LoadPicture(source);
+        using (owner)
         {
-            return false;
-        }
+            if (picture is null)
+            {
+                return false;
+            }
 
-        SKRect bounds = document.Picture.CullRect;
-        if (bounds.Width <= 0 || bounds.Height <= 0)
+            SKRect bounds = picture.CullRect;
+            if (bounds.Width <= 0 || bounds.Height <= 0)
+            {
+                return false;
+            }
+
+            using var surface = SKSurface.Create(new SKImageInfo(
+                Pixels,
+                Pixels,
+                SKColorType.Bgra8888,
+                SKAlphaType.Premul));
+
+            float scale = Math.Min(Pixels / bounds.Width, Pixels / bounds.Height);
+            SKCanvas canvas = surface.Canvas;
+            canvas.Clear(SKColors.Transparent);
+            canvas.Translate(
+                (Pixels - (bounds.Width * scale)) / 2,
+                (Pixels - (bounds.Height * scale)) / 2);
+            canvas.Scale(scale);
+            canvas.DrawPicture(picture);
+            canvas.Flush();
+
+            System.IO.Directory.CreateDirectory(Path.GetDirectoryName(target)!);
+            using SKImage image = surface.Snapshot();
+            using SKData data = image.Encode(SKEncodedImageFormat.Png, 100);
+            using FileStream file = File.Create(target);
+            data.SaveTo(file);
+            return true;
+        }
+    }
+
+    private static (SKPicture? Picture, IDisposable? Owner) LoadPicture(string source)
+    {
+        try
         {
-            return false;
+            if (source.EndsWith(".svg", StringComparison.OrdinalIgnoreCase))
+            {
+                var svg = new SKSvg();
+                svg.Load(source);
+                return (svg.Picture, svg);
+            }
+
+            using var bitmap = SKBitmap.Decode(source);
+            if (bitmap is null || bitmap.Width <= 0 || bitmap.Height <= 0)
+            {
+                return (null, null);
+            }
+
+            using var image = SKImage.FromBitmap(bitmap);
+            var recorder = new SKPictureRecorder();
+            using (SKCanvas canvas = recorder.BeginRecording(SKRect.Create(0, 0, bitmap.Width, bitmap.Height)))
+            {
+                canvas.DrawImage(image, 0, 0);
+            }
+
+            SKPicture picture = recorder.EndRecording();
+            return (picture, picture);
         }
-
-        using var surface = SKSurface.Create(new SKImageInfo(
-            Pixels,
-            Pixels,
-            SKColorType.Bgra8888,
-            SKAlphaType.Premul));
-
-        float scale = Math.Min(Pixels / bounds.Width, Pixels / bounds.Height);
-        SKCanvas canvas = surface.Canvas;
-        canvas.Clear(SKColors.Transparent);
-        canvas.Translate(
-            (Pixels - (bounds.Width * scale)) / 2,
-            (Pixels - (bounds.Height * scale)) / 2);
-        canvas.Scale(scale);
-        canvas.DrawPicture(document.Picture);
-        canvas.Flush();
-
-        System.IO.Directory.CreateDirectory(Path.GetDirectoryName(target)!);
-        using SKImage image = surface.Snapshot();
-        using SKData data = image.Encode(SKEncodedImageFormat.Png, 100);
-        using FileStream file = File.Create(target);
-        data.SaveTo(file);
-        return true;
+        catch (Exception exception)
+        {
+            Services.Diagnostics.Log($"failed to load thumbnail picture from '{source}': {exception.Message}");
+            return (null, null);
+        }
     }
 
     /// <summary>Charm ids are camelCase words, but a file name should not have to trust that.</summary>

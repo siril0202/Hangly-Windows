@@ -135,7 +135,7 @@ jobs:
           vpk pack --packId Hangly `
             --packVersion ${{ steps.version.outputs.version }} `
             --packDir publish --mainExe Hangly.exe `
-            --packTitle Hangly --packAuthors sharancreatedthis `
+            --packTitle Hangly --packAuthors codewithsiril `
             --outputDir releases --runtime ${{ matrix.rid }} --channel ${{ matrix.rid }} `
             --releaseNotes notes.md
           if ($LASTEXITCODE -ne 0) { exit 1 }

@@ -40,6 +40,8 @@ public static class CollectionRopes
         ["gameOfThrones"] = RopeStyle.MidnightCord,
         ["airJordan"] = RopeStyle.SilverChain,
         ["pokemon"] = RopeStyle.SilverCord,
+        ["shinchan"] = RopeStyle.Thread,
+        ["cartoons"] = RopeStyle.Thread,
     };
 
     /// <summary>The cord a collection was drawn to hang on, or null for a category that is not a collection.</summary>
